@@ -49,7 +49,7 @@
         - Show relevant updates in alert-update email preview. #3417
         - Add German and Swiss language packs to default
         linux install #3544
-        - Upgrade jQuery. #3017
+        - Upgrade jQuery to 3.6.0. #3017
     - Open311 improvements:
         - Consistent protected field ordering.
     - Security:
