@@ -1,0 +1,3 @@
+[% IF title == 'Garden Subscription - New' %]
+Check your bin collections day: https://recyclingservices.bromley.gov.uk/waste[% IF property_id %]/[% property_id %][% END %]
+[% END %]
