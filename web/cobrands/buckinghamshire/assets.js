@@ -180,7 +180,8 @@ fixmystreet.assets.add(defaults, {
     },
     stylemap: fixmystreet.assets.stylemap_invisible,
     asset_category: ["Blocked drain"],
-    asset_item: 'drain'
+    asset_item: 'drain',
+    non_interactive: true
 });
 
 fixmystreet.assets.add(defaults, {
@@ -206,21 +207,14 @@ fixmystreet.assets.add(defaults, {
             });
         }
         var last_clean = '';
+        var message = ' ';
         if (inspection && inspection[0]) {
             if (asset.attributes.last_inspected && inspection[0].attributes.junction_cleaned === 'true') {
                 last_clean = format_date(asset.attributes.last_inspected);
+                message = 'This gulley was last cleaned on ' + last_clean;
             }
-            var next_clean = format_date(asset.attributes.cyclical_target_date);
-            var message = '';
-            if (last_clean) { message += 'This gulley was last cleaned on ' + last_clean; }
-            if (next_clean && last_clean) {
-                message += '. It will be cleaned again before ' + next_clean;
-            } else if (next_clean) {
-                message += 'This gulley will be cleaned before ' + next_clean;
-            }
-            return message || "This gulley has no cleaning history";
         }
-        return "This gulley has no cleaning history";
+        return message;
     },
     actions: {
         asset_found: fixmystreet.assets.named_select_action_found,

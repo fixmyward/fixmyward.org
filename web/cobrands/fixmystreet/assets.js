@@ -511,9 +511,9 @@ function _update_message(message, c) {
         id = "category_meta_message_" + prefix,
         $p = $('#' + id);
     if (message) {
-        $p.html(message);
+        $p.html(message).show();
     } else {
-        $p.remove();
+        $p.hide();
     }
 }
 
