@@ -135,26 +135,16 @@ subtest 'Updates from staff with no text but with private comments are sent' => 
     FixMyStreet::override_config {
         ALLOWED_COBRANDS => 'bromley',
     }, sub {
-        my $test_res = HTTP::Response->new();
-        $test_res->code(200);
-        $test_res->message('OK');
-        $test_res->content('<?xml version="1.0" encoding="utf-8"?><service_request_updates><request_update><update_id>42</update_id></request_update></service_request_updates>');
+        Open311->_inject_response('/servicerequestupdates.xml', '<?xml version="1.0" encoding="utf-8"?><service_request_updates><request_update><update_id>42</update_id></request_update></service_request_updates>');
 
-        my $open311_params = {
-            test_mode => 1,
-            test_get_returns => { 'servicerequestupdates.xml' => $test_res },
-        };
-
-        my $updates = Open311::PostServiceRequestUpdates->new(
-            open311_extra_params => $open311_params,
-        );
+        my $updates = Open311::PostServiceRequestUpdates->new();
         $updates->send;
 
         $comment->discard_changes;
         ok $comment->whensent, "comment was sent";
         ok !$comment->get_extra_metadata('cobrand_skipped_sending'), "didn't skip sending comment";
 
-        my $req = $updates->current_open311->test_req_used;
+        my $req = Open311->test_req_used;
         my $c = CGI::Simple->new($req->content);
         like $c->param('description'), qr/Private comments: This comment has secret notes/, 'private comments included in update description';
     };
@@ -266,15 +256,7 @@ subtest 'Private comments on updates are added to open311 description' => sub {
     }, sub {
         $report->comments->delete;
 
-        my $test_res = HTTP::Response->new();
-        $test_res->code(200);
-        $test_res->message('OK');
-        $test_res->content('<?xml version="1.0" encoding="utf-8"?><service_request_updates><request_update><update_id>42</update_id></request_update></service_request_updates>');
-
-        my $open311_params = {
-            test_mode => 1,
-            test_get_returns => { 'servicerequestupdates.xml' => $test_res },
-        };
+        Open311->_inject_response('/servicerequestupdates.xml', '<?xml version="1.0" encoding="utf-8"?><service_request_updates><request_update><update_id>42</update_id></request_update></service_request_updates>');
 
         $mech->log_out_ok;
         $mech->log_in_ok($staffuser->email);
@@ -299,16 +281,14 @@ subtest 'Private comments on updates are added to open311 description' => sub {
         my $comment = $report->comments->first;
         is $comment->get_extra_metadata('private_comments'), 'Secret update notes', 'private comments saved to comment';
 
-        my $updates = Open311::PostServiceRequestUpdates->new(
-            open311_extra_params => $open311_params,
-        );
+        my $updates = Open311::PostServiceRequestUpdates->new();
         $updates->send;
 
         $comment->discard_changes;
         ok $comment->whensent, 'Comment marked as sent';
         unlike $comment->text, qr/Private comments/, 'private comments not saved to update text';
 
-        my $req = $updates->current_open311->test_req_used;
+        my $req = Open311->test_req_used;
         my $c = CGI::Simple->new($req->content);
         like $c->param('description'), qr/Private comments: Secret update notes/, 'private comments included in update description';
     };

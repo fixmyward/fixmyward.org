@@ -14,8 +14,6 @@ use Open311;
 use constant SEND_METHOD_OPEN311 => 'Open311';
 
 has verbose => ( is => 'ro', default => 0 );
-has open311_extra_params => ( is => 'rw', default => sub { {} } );
-has current_open311 => ( is => 'rw' );
 
 sub send {
     my $self = shift;
@@ -43,7 +41,6 @@ sub fetch_bodies {
 sub construct_open311 {
     my ($self, $body, $comment) = @_;
     my $o = Open311->new($self->open311_params($body, $comment));
-    $self->current_open311($o);
     return $o;
 }
 
@@ -63,7 +60,6 @@ sub open311_params {
         api_key => $conf->api_key,
         extended_statuses => $body->send_extended_statuses,
         fixmystreet_body => $body,
-        %{$self->open311_extra_params},
     );
 
     my $cobrand = $body->get_cobrand_handler;
