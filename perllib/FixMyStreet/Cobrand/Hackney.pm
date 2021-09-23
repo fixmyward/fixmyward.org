@@ -3,6 +3,10 @@ use parent 'FixMyStreet::Cobrand::Whitelabel';
 
 use strict;
 use warnings;
+
+use Moo;
+with 'FixMyStreet::Roles::Open311Alloy';
+
 use JSON::MaybeXS;
 use URI::Escape;
 use mySociety::EmailUtil qw(is_valid_email is_valid_email_list);
@@ -128,25 +132,11 @@ sub addresses_for_postcode {
     return { addresses => \@addresses };
 }
 
-sub open311_config {
-    my ($self, $row, $h, $params) = @_;
+around open311_extra_data_include => sub {
+    my ($orig, $self) = (shift, shift);
+    my $open311_only = $self->$orig(@_);
 
-    $params->{multi_photos} = 1;
-}
-
-sub open311_extra_data {
-    my ($self, $row, $h, $contact) = @_;
-
-    my $open311_only = [
-        { name => 'report_url',
-          value => $h->{url} },
-        { name => 'title',
-          value => $row->title },
-        { name => 'description',
-          value => $row->detail },
-        { name => 'category',
-          value => $row->category },
-    ];
+    my ($row, $h, $contact) = @_;
 
     # Make sure contact 'email' set correctly for Open311
     if (my $split_match = $row->get_extra_metadata('split_match')) {
@@ -156,7 +146,7 @@ sub open311_extra_data {
     }
 
     return $open311_only;
-}
+};
 
 sub map_type { 'OSM' }
 
@@ -330,6 +320,41 @@ sub dashboard_export_problems_add_columns {
             extra_details => $report->get_extra_metadata('detailed_information') || '',
         };
     });
+}
+
+
+=head2 update_email_shortlisted_user
+
+When an update is left on a Hackney report, this hook will send an alert email
+to the email address(es) that originally received the report.
+
+=cut
+
+sub update_email_shortlisted_user {
+    my ($self, $update) = @_;
+    my $c = $self->{c};
+    my $cobrand = FixMyStreet::Cobrand::Hackney->new; # $self may be FMS
+    return if $update->problem->cobrand_data eq 'noise' || !$update->problem->to_body_named('Hackney');
+    my $sent_to = $update->problem->get_extra_metadata('sent_to');
+    if (@$sent_to) {
+        my @to = map { [ $_, $cobrand->council_name ] } @$sent_to;
+        $c->send_email('alert-update.txt', {
+            additional_template_paths => [
+                FixMyStreet->path_to( 'templates', 'email', 'hackney' ),
+                FixMyStreet->path_to( 'templates', 'email', 'fixmystreet.com'),
+            ],
+            to => \@to,
+            report => $update->problem,
+            cobrand => $cobrand,
+            problem_url => $cobrand->base_url . $update->problem->url,
+            data => [ {
+                item_photo => $update->photo,
+                item_text => $update->text,
+                item_name => $update->name,
+                item_anonymous => $update->anonymous,
+            } ],
+        });
+    }
 }
 
 1;

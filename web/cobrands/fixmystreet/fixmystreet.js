@@ -540,6 +540,10 @@ $.extend(fixmystreet.set_up, {
     }
 
     var category_changed = function(category) {
+        if (!fixmystreet.reporting_data) {
+            return; // This will be called again when the data arrives
+        }
+
         var data = fixmystreet.reporting_data.by_category[category] || {},
             $category_meta = $('#category_meta');
 
@@ -564,7 +568,7 @@ $.extend(fixmystreet.set_up, {
             $new_category_meta.closest('.js-reporting-page').toggleClass('js-reporting-page--skip', !!data.extra_hidden);
             // Preserve any existing values
             $category_meta.find("[name]").each(function() {
-                $new_category_meta.find("[name="+this.name+"]").val(this.value);
+                $new_category_meta.find("[name='"+this.name+"']").val(this.value);
             });
         } else {
             $category_meta.closest('.js-reporting-page').addClass('js-reporting-page--skip');
@@ -657,7 +661,7 @@ $.extend(fixmystreet.set_up, {
     // If we haven't got any reporting data (e.g. came straight to
     // /report/new), fetch it first. That will then automatically call this
     // function again, due to it calling change() on the category if set.
-    if (!fixmystreet.reporting_data && fixmystreet.page === 'new') {
+    if (!fixmystreet.reporting_data && fixmystreet.page === 'new' && !$('body').hasClass('formflow')) {
         fixmystreet.fetch_reporting_data();
     }
   },
@@ -745,6 +749,7 @@ $.extend(fixmystreet.set_up, {
       var $originalLabel = $('[for="form_photo"], .js-photo-label', $context);
       var $originalInput = $('#form_photos, .js-photo-fields', $context);
       var $dropzone = $('<div tabindex=0>').addClass('dropzone');
+      var $fileid_input = $originalInput.data('upload-field') || 'upload_fileid';
 
       $originalLabel.removeAttr('for');
       $('[data-plural]', $originalLabel).text(
@@ -789,18 +794,25 @@ $.extend(fixmystreet.set_up, {
             $('input[type=submit]', $context).prop('disabled', false).addClass('green-btn');
           });
           this.on("success", function(file, xhrResponse) {
-            var ids = $('input[name=upload_fileid]', $context).val().split(','),
-                id = (file.server_id = xhrResponse.id),
-                l = ids.push(id),
-                newstr = ids.join(',');
-            $('input[name=upload_fileid]', $context).val(newstr);
+            var $upload_fileids = $('input[name=' + $fileid_input + ']', $context);
+            var ids = [];
+            // only split if it has a value otherwise you get a spurious empty string
+            // in the array as split returns the whole string if no match
+            if ( $upload_fileids.val() ) {
+                ids = $upload_fileids.val().split(',');
+            }
+            var id = (file.server_id = xhrResponse.id),
+                l = ids.push(id);
+            newstr = ids.join(',');
+            $upload_fileids.val(newstr);
           });
           this.on("error", function(file, errorMessage, xhrResponse) {
           });
           this.on("removedfile", function(file) {
-            var ids = $('input[name=upload_fileid]', $context).val().split(','),
+            var $upload_fileids = $('input[name=' + $fileid_input + ']', $context);
+            var ids = $upload_fileids.val().split(','),
                 newstr = $.grep(ids, function(n) { return (n!=file.server_id); }).join(',');
-            $('input[name=upload_fileid]', $context).val(newstr);
+            $upload_fileids.val(newstr);
           });
           this.on("maxfilesexceeded", function(file) {
             this.removeFile(file);
@@ -822,7 +834,7 @@ $.extend(fixmystreet.set_up, {
           }
       });
 
-      $.each($('input[name=upload_fileid]', $context).val().split(','), function(i, f) {
+      $.each($('input[name=' + $fileid_input + ']', $context).val().split(','), function(i, f) {
         if (!f) {
             return;
         }
@@ -1410,8 +1422,8 @@ fixmystreet.update_councils_text = function(data) {
 fixmystreet.update_pin = function(lonlat, savePushState) {
     var lonlats = fixmystreet.maps.update_pin(lonlat);
 
-    if ($('body').hasClass('noise')) {
-        // Do nothing for noise map page
+    if ($('body').hasClass('formflow')) {
+        // Do nothing for form flow map page
         return;
     }
 
@@ -1836,8 +1848,8 @@ $(function() {
     // The replaceState below means that normal browser behaviour with POSTed
     // pages stops working (because the replaceState turns the POST into a
     // GET), e.g. clicking back in a multi-page form reloads the page and
-    // takes you back to the start, so avoid that on the noise flow.
-    if ($('body').hasClass('noise')) {
+    // takes you back to the start, so avoid that on the form-based flow.
+    if ($('body').hasClass('formflow')) {
         return;
     }
 
@@ -1865,6 +1877,7 @@ $(function() {
                     return;
                 }
 
+                var reports_list_trigger;
                 if ('initial' in e.state) {
                     if (fixmystreet.original.page === 'new') {
                         // Started at /report/new, so go back to first 'page' there
@@ -1888,10 +1901,10 @@ $(function() {
                         var qs = fixmystreet.utils.parse_query_string();
                         page = qs.p || 1;
                         $('#show_old_reports').prop('checked', qs.show_old_reports || '');
-                        $('.pagination:first').data('page', page)
-                            .trigger('change.filters');
+                        fixmystreet.markers.protocol.use_page = true;
+                        $('.pagination:first').data('page', page);
                     }
-                    fixmystreet.display.reports_list(location.href);
+                    reports_list_trigger = $('.pagination:first');
                 } else if ('reportId' in e.state) {
                     fixmystreet.display.report(e.state.reportPageUrl, e.state.reportId);
                 } else if ('newReportAtLonlat' in e.state) {
@@ -1906,19 +1919,15 @@ $(function() {
                 } else if ('page_change' in e.state) {
                     fixmystreet.markers.protocol.use_page = true;
                     $('#show_old_reports').prop('checked', e.state.page_change.show_old_reports);
-                    $('.pagination:first').data('page', e.state.page_change.page) //;
-                        .trigger('change.filters');
-                    if ( fixmystreet.page != 'reports' ) {
-                        fixmystreet.display.reports_list(location.href);
-                    }
+                    $('.pagination:first').data('page', e.state.page_change.page);
+                    reports_list_trigger = $('.pagination:first');
                 } else if ('filter_change' in e.state) {
                     $('#filter_categories').val(e.state.filter_change.filter_categories);
                     $('#statuses').val(e.state.filter_change.statuses);
                     $('#sort').val(e.state.filter_change.sort);
                     $('#show_old_reports').prop('checked', e.state.filter_change.show_old_reports);
-                    $('#filter_categories').add('#statuses')
-                        .trigger('change.filters').trigger('change.multiselect');
-                    fixmystreet.display.reports_list(location.href);
+                    $('#filter_categories').add('#statuses').trigger('change.multiselect');
+                    reports_list_trigger = $('#filter_categories');
                 // } else if ('hashchange' in e.state) {
                     // This popstate was just here because the hash changed.
                     // (eg: mobile nav click.) We want to ignore it.
@@ -1928,6 +1937,15 @@ $(function() {
                         popstate: true
                     });
                 }
+
+                if (reports_list_trigger) {
+                    if (fixmystreet.page.match(/reports|around|my/)) {
+                        reports_list_trigger.trigger('change.filters');
+                    } else {
+                        fixmystreet.display.reports_list(location.href);
+                    }
+                }
+
                 if ('mapState' in e.state) {
                     fixmystreet.maps.set_map_state(e.state.mapState);
                 }

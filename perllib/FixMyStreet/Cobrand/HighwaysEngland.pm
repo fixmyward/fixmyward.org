@@ -23,7 +23,7 @@ sub body {
 }
 
 # Copying of functions from UKCouncils that are needed here also - factor out to a role of some sort?
-sub cut_off_date { '' }
+sub cut_off_date { '2020-11-09' }
 sub problems_restriction { FixMyStreet::Cobrand::UKCouncils::problems_restriction($_[0], $_[1]) }
 sub problems_on_map_restriction { $_[0]->problems_restriction($_[1]) }
 sub problems_sql_restriction { FixMyStreet::Cobrand::UKCouncils::problems_sql_restriction($_[0], $_[1]) }
@@ -158,32 +158,6 @@ sub munge_report_new_contacts {
     }
 }
 
-sub munge_sendreport_params {
-    my ($self, $row, $h, $params) = @_;
-
-    if (!$row->get_extra_field_value('area_name')) {
-        my $cfg = $self->lookup_site_code_config;
-        my ($x, $y) = $row->local_coords;
-        my $ukc = FixMyStreet::Cobrand::UKCouncils->new;
-        my $features = $ukc->_fetch_features($cfg, $x, $y);
-        my $nearest = $ukc->_nearest_feature($cfg, $x, $y, $features);
-        if ($nearest) {
-            my $attr = $nearest->{properties};
-            $row->update_extra_field({ name => 'road_name', value => $attr->{ROA_NUMBER}, description => 'Road name' });
-            $row->update_extra_field({ name => 'area_name', value => $attr->{area_name}, description => 'Area name' });
-            $row->update_extra_field({ name => 'sect_label', value => $attr->{sect_label}, description => 'Road sector' });
-        }
-    }
-}
-
-sub lookup_site_code_config { {
-    buffer => 15, # metres
-    url => "https://tilma.mysociety.org/mapserver/highways",
-    srsname => "urn:ogc:def:crs:EPSG::27700",
-    typename => "Highways",
-    accept_feature => sub { 1 }
-} }
-
 sub report_new_is_on_he_road {
     my ( $self ) = @_;
 
@@ -207,18 +181,45 @@ sub report_new_is_on_he_road {
 sub dashboard_export_problems_add_columns {
     my ($self, $csv) = @_;
 
+    $csv->modify_csv_header( Ward => 'Council' );
+
+    $csv->objects_attrs({
+        '+columns' => ['comments.text', 'comments.extra', 'user.name'],
+        join => { comments => 'user' },
+    });
+
     $csv->add_csv_columns(
         area_name => 'Area name',
         where_hear => 'How you found us',
     );
+    for (my $i=1; $i<=5; $i++) {
+        $csv->add_csv_columns(
+            "update_text_$i" => "Update $i",
+            "update_date_$i" => "Update $i date",
+            "update_name_$i" => "Update $i name",
+        );
+    }
 
     $csv->csv_extra_data(sub {
         my $report = shift;
 
-        return {
+        my $fields = {
             area_name => $report->get_extra_field_value('area_name'),
             where_hear => $report->get_extra_metadata('where_hear'),
         };
+
+        my $i = 1;
+        for my $update ($report->comments->search(undef, { order_by => ['confirmed', 'id'] })) {
+            next unless $update->state eq 'confirmed';
+            last if $i > 5;
+            $fields->{"update_text_$i"} = $update->text;
+            $fields->{"update_date_$i"} = $update->confirmed;
+            my $staff = $update->get_extra_metadata('contributed_by') || $update->get_extra_metadata('is_body_user') || $update->get_extra_metadata('is_superuser');
+            $fields->{"update_name_$i"} = $staff ? $update->user->name : 'public';
+            $i++;
+        }
+
+        return $fields;
     });
 }
 

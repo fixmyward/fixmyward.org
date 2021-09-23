@@ -54,7 +54,7 @@ sub restriction {
 # body. Except TfL and Highways England.
 sub body {
     my $self = shift;
-    my $body = FixMyStreet::DB->resultset('Body')->for_areas($self->council_area_id)->search({ name => { 'not_in', ['TfL', 'Highways England'] } })->first;
+    my $body = FixMyStreet::DB->resultset('Body')->for_areas($self->council_area_id)->search({ name => { 'not_in', ['TfL', 'Highways England', 'Environment Agency'] } })->first;
     return $body;
 }
 
@@ -331,6 +331,12 @@ sub munge_report_new_bodies {
             %$bodies = map { $_->id => $_ } grep { $_->name ne 'Highways England' } values %$bodies;
         }
     }
+
+    # Environment agency added with odour category for FixmyStreet
+    # in all England areas, but should not show for cobrands
+    if ( $bodies{'Environment Agency'} ) {
+        %$bodies = map { $_->id => $_ } grep { $_->name ne 'Environment Agency' } values %$bodies;
+    }
 }
 
 sub munge_report_new_contacts {
@@ -500,6 +506,21 @@ sub updates_disallowed {
 
     return $self->next::method(@_);
 }
+
+# Report if cobrand denies updates by user
+sub deny_updates_by_user {
+    my ($self, $row) = @_;
+    my $cfg = $self->feature('updates_allowed') || '';
+    if ($cfg eq 'none' || $cfg eq 'staff') {
+        return 1;
+    } elsif ($cfg eq 'reporter-open' && !$row->is_open) {
+        return 1;
+    } elsif ($cfg eq 'open' && !$row->is_open) {
+        return 1;
+    } else {
+        return;
+    }
+};
 
 sub extra_contact_validation {
     my $self = shift;

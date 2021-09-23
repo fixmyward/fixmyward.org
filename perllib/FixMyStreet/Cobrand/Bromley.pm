@@ -8,6 +8,7 @@ use DateTime::Format::W3CDTF;
 use DateTime::Format::Flexible;
 use File::Temp;
 use Integrations::Echo;
+use Integrations::Pay360;
 use JSON::MaybeXS;
 use List::Util qw(any);
 use Parallel::ForkManager;
@@ -180,6 +181,27 @@ sub title_list {
     return ["MR", "MISS", "MRS", "MS", "DR"];
 }
 
+sub waste_check_staff_payment_permissions {
+    my $self = shift;
+    my $c = $self->{c};
+
+
+    return unless $c->stash->{is_staff};
+
+    if ( $c->user->has_permission_to('can_pay_with_csc', $self->body->id) ) {
+        $c->stash->{staff_payments_allowed} = 1;
+    }
+}
+
+sub available_permissions {
+    my $self = shift;
+
+    my $perms = $self->next::method();
+    $perms->{Waste}->{can_pay_with_csc} = "Can use CSC to pay for subscriptions";
+
+    return $perms;
+}
+
 sub open311_config {
     my ($self, $row, $h, $params) = @_;
 
@@ -200,6 +222,17 @@ sub open311_extra_data_include {
         $title .= ' | PROW ID: ' . $_->{value} if $_->{name} eq 'prow_reference';
     }
 
+    # Add contributing user's roles to report title
+    my $contributed_by = $row->get_extra_metadata('contributed_by');
+    my $contributing_user = FixMyStreet::DB->resultset('User')->find({ id => $contributed_by });
+    my $roles;
+    if ($contributing_user) {
+        $roles = join(',', map { $_->name } $contributing_user->roles->all);
+    }
+    if ($roles) {
+        $title .= ' | ROLES: ' . $roles;
+    }
+
     my $open311_only = [
         { name => 'report_url',
           value => $h->{url} },
@@ -214,6 +247,12 @@ sub open311_extra_data_include {
         { name => 'email',
           value => $row->user->email }
     ];
+
+    if ( $row->category eq 'Garden Subscription' ) {
+        if ( $row->get_extra_metadata('contributed_as') && $row->get_extra_metadata('contributed_as') eq 'anonymous_user' ) {
+            push @$open311_only, { name => 'contributed_as', value => 'anonymous_user' };
+        }
+    }
 
     # make sure we have last_name attribute present in row's extra, so
     # it is passed correctly to Bromley as attribute[]
@@ -243,6 +282,20 @@ sub open311_config_updates {
 sub open311_pre_send {
     my ($self, $row, $open311) = @_;
 
+    $self->_include_user_title_in_extra($row);
+
+    $self->{bromley_original_detail} = $row->detail;
+
+    my $private_comments = $row->get_extra_metadata('private_comments');
+    if ($private_comments) {
+        my $text = $row->detail . "\n\nPrivate comments: $private_comments";
+        $row->detail($text);
+    }
+}
+
+sub _include_user_title_in_extra {
+    my ($self, $row) = @_;
+
     my $extra = $row->extra || {};
     unless ( $extra->{title} ) {
         $extra->{title} = $row->user->title;
@@ -252,7 +305,22 @@ sub open311_pre_send {
 
 sub open311_pre_send_updates {
     my ($self, $row) = @_;
-    return $self->open311_pre_send($row);
+
+    $self->{bromley_original_update_text} = $row->text;
+
+    my $private_comments = $row->get_extra_metadata('private_comments');
+    if ($private_comments) {
+        my $text = $row->text . "\n\nPrivate comments: $private_comments";
+        $row->text($text);
+    }
+
+    return $self->_include_user_title_in_extra($row);
+}
+
+sub open311_post_send_updates {
+    my ($self, $row) = @_;
+
+    $row->text($self->{bromley_original_update_text});
 }
 
 sub open311_munge_update_params {
@@ -261,6 +329,15 @@ sub open311_munge_update_params {
     $params->{public_anonymity_required} = $comment->anonymous ? 'TRUE' : 'FALSE',
     $params->{update_id_ext} = $comment->id;
     $params->{service_request_id_ext} = $comment->problem->id;
+}
+
+sub open311_post_send {
+    my ($self, $row, $h, $sender) = @_;
+    $row->detail($self->{bromley_original_detail});
+    my $error = $sender->error;
+    if ($error =~ /Missed Collection event already open for the property/) {
+        $row->state('duplicate');
+    }
 }
 
 sub open311_contact_meta_override {
@@ -305,6 +382,14 @@ sub open311_contact_meta_override {
     );
     my %ignore = map { $_ => 1 } @override;
     @$meta = grep { !$ignore{$_->{code}} } @$meta;
+}
+
+sub should_skip_sending_update {
+    my ($self, $update) = @_;
+
+    my $private_comments = $update->get_extra_metadata('private_comments');
+
+    return $update->user->from_body && !$update->text && !$private_comments;
 }
 
 # If any subcategories ticked in user edit admin, make sure they're saved.
@@ -408,16 +493,27 @@ sub munge_around_category_where {
 
 sub munge_reports_category_list {
     my ($self, $categories) = @_;
-    return if $self->{c}->action eq 'dashboard/heatmap';
-    @$categories = grep { grep { $_ ne 'Waste' } @{$_->groups} } @$categories;
+    my $c = $self->{c};
+    return if $c->action eq 'dashboard/heatmap';
+
+    unless ( $c->user_exists && $c->user->from_body && $c->user->has_permission_to('report_mark_private', $self->body->id) ) {
+        @$categories = grep { grep { $_ ne 'Waste' } @{$_->groups} } @$categories;
+    }
 }
 
 sub munge_report_new_contacts {
     my ($self, $categories) = @_;
 
-    return if $self->{c}->action =~ /^waste/;
+    if ($self->{c}->action =~ /^waste/) {
+        @$categories = grep { grep { $_ eq 'Waste' } @{$_->groups} } @$categories;
+        return;
+    }
 
-    @$categories = grep { grep { $_ ne 'Waste' } @{$_->groups} } @$categories;
+    if ($self->{c}->stash->{categories_for_point}) {
+        # Have come from an admin tool
+    } else {
+        @$categories = grep { grep { $_ ne 'Waste' } @{$_->groups} } @$categories;
+    }
     $self->SUPER::munge_report_new_contacts($categories);
 }
 
@@ -431,7 +527,7 @@ sub updates_disallowed {
     return $self->next::method(@_);
 }
 
-sub clear_cached_lookups {
+sub clear_cached_lookups_property {
     my ($self, $id) = @_;
 
     my $key = "bromley:echo:look_up_property:$id";
@@ -551,9 +647,40 @@ sub image_for_service {
     return $images->{$service_id};
 }
 
-sub bin_services_for_address {
-    my $self = shift;
-    my $property = shift;
+sub available_bin_services_for_address {
+    my ($self, $property) = @_;
+
+    my $services = $self->{c}->stash->{services};
+    return {} unless keys %$services;
+
+    my $available_services = {};
+    for my $service ( values %$services ) {
+        my $name = $service->{service_name};
+        $name =~ s/ /_/g;
+        $available_services->{$name} = {
+            service_id => $service->{service_id},
+            is_active => 1,
+        };
+    }
+
+    return $available_services;
+}
+
+sub garden_waste_service_id {
+    return 545;
+}
+
+sub get_current_garden_bins {
+    my ($self) = @_;
+
+    my $service = $self->garden_waste_service_id;
+    my $bin_count = $self->{c}->stash->{services}{$service}->{garden_bins};
+
+    return $bin_count;
+}
+
+sub service_name_override {
+    my $service = shift;
 
     my %service_name_override = (
         531 => 'Non-Recyclable Refuse',
@@ -568,6 +695,41 @@ sub bin_services_for_address {
         545 => 'Garden Waste',
     );
 
+    return $service_name_override{$service->{ServiceId}} || $service->{ServiceName};
+}
+
+sub bin_payment_types {
+    return {
+        'csc' => 1,
+        'credit_card' => 2,
+        'direct_debit' => 3,
+    };
+}
+
+sub waste_subscription_types {
+    return {
+        New => 1,
+        Renew => 2,
+        Amend => 3,
+    };
+}
+
+sub waste_container_actions {
+    return {
+        deliver => 1,
+        remove => 2
+    };
+}
+
+sub waste_staff_source {
+    my $self = shift;
+    $self->_set_user_source;
+}
+
+sub bin_services_for_address {
+    my $self = shift;
+    my $property = shift;
+
     $self->{c}->stash->{containers} = {
         1 => 'Green Box (Plastic)',
         3 => 'Wheeled Bin (Plastic)',
@@ -578,6 +740,9 @@ sub bin_services_for_address {
         44 => 'Garden Waste Container',
         46 => 'Wheeled Bin (Food)',
     };
+
+    $self->{c}->stash->{container_actions} = $self->waste_container_actions;
+
     my %service_to_containers = (
         535 => [ 1 ],
         536 => [ 3 ],
@@ -595,20 +760,28 @@ sub bin_services_for_address {
         541 => 4,
         542 => 6,
         544 => 4,
+        545 => 6,
     );
+
+    $self->{c}->stash->{quantity_max} = \%quantity_max;
+
+    $self->{c}->stash->{garden_subs} = $self->waste_subscription_types;
 
     my $result = $self->{api_serviceunits};
     return [] unless @$result;
 
     my $events = $self->{api_events};
     my $open = $self->_parse_open_events($events);
+    $self->{c}->stash->{open_service_requests} = $open->{enquiry};
 
     my @to_fetch;
     my %schedules;
     my @task_refs;
+    my %expired;
     foreach (@$result) {
-        my $servicetask = _parse_servicetasks($_) or next;
+        my $servicetask = _get_current_service_task($_) or next;
         my $schedules = _parse_schedules($servicetask);
+        $expired{$_->{Id}} = $schedules if $self->waste_sub_overdue( $schedules->{end_date}, weeks => 4 );
 
         next unless $schedules->{next} or $schedules->{last};
         $schedules{$_->{Id}} = $schedules;
@@ -622,21 +795,25 @@ sub bin_services_for_address {
     my @out;
     my %task_ref_to_row;
     foreach (@$result) {
-        next unless $schedules{$_->{Id}};
-        my $schedules = $schedules{$_->{Id}};
-        my $servicetask = _parse_servicetasks($_);
+        my $service_name = service_name_override($_);
+        next unless $schedules{$_->{Id}} || ( $service_name eq 'Garden Waste' && $expired{$_->{Id}} );
+
+        my $schedules = $schedules{$_->{Id}} || $expired{$_->{Id}};
+        my $servicetask = _get_current_service_task($_);
 
         my $events = $calls->{"GetEventsForObject ServiceUnit $_->{Id}"};
         my $open_unit = $self->_parse_open_events($events);
 
         my $containers = $service_to_containers{$_->{ServiceId}};
         my ($open_request) = grep { $_ } map { $open->{request}->{$_} } @$containers;
-        my $service_name = $service_name_override{$_->{ServiceId}} || $_->{ServiceName};
 
         my $request_max = $quantity_max{$_->{ServiceId}};
 
         my $garden = 0;
         my $garden_bins;
+        my $garden_cost = 0;
+        my $garden_due = $self->waste_sub_due($schedules->{end_date});
+        my $garden_overdue = $expired{$_->{Id}};
         if ($service_name eq 'Garden Waste') {
             $garden = 1;
             my $data = Integrations::Echo::force_arrayref($servicetask->{Data}, 'ExtensibleDatum');
@@ -645,10 +822,17 @@ sub bin_services_for_address {
                 my $moredata = Integrations::Echo::force_arrayref($_->{ChildData}, 'ExtensibleDatum');
                 foreach (@$moredata) {
                     # $container = $_->{Value} if $_->{DatatypeName} eq 'Container'; # should be 44
-                    $garden_bins = $_->{Value} if $_->{DatatypeName} eq 'Quantity';
+                    if ( $_->{DatatypeName} eq 'Quantity' ) {
+                        $garden_bins = $_->{Value};
+                        $garden_cost = $self->garden_waste_cost($garden_bins) / 100;
+                    }
                 }
             }
             $request_max = $garden_bins;
+
+            if ($self->{c}->stash->{waste_features}->{garden_disabled}) {
+                $garden = 0;
+            }
         }
 
         my $row = {
@@ -657,18 +841,21 @@ sub bin_services_for_address {
             service_name => $service_name,
             garden_waste => $garden,
             garden_bins => $garden_bins,
+            garden_cost => $garden_cost,
+            garden_due => $garden_due,
+            garden_overdue => $garden_overdue,
             report_open => $open->{missed}->{$_->{ServiceId}} || $open_unit->{missed}->{$_->{ServiceId}},
-            request_allowed => $request_allowed{$_->{ServiceId}} && $request_max,
+            request_allowed => $request_allowed{$_->{ServiceId}} && $request_max && $schedules->{next},
             request_open => $open_request,
             request_containers => $containers,
             request_max => $request_max,
-            enquiry_open_events => $open->{enquiry},
             service_task_id => $servicetask->{Id},
             service_task_name => $servicetask->{TaskTypeName},
             service_task_type_id => $servicetask->{TaskTypeId},
             schedule => $schedules->{description},
             last => $schedules->{last},
             next => $schedules->{next},
+            end_date => $schedules->{end_date},
         };
         if ($row->{last}) {
             my $ref = join(',', @{$row->{last}{ref}});
@@ -732,6 +919,30 @@ sub bin_services_for_address {
     return \@out;
 }
 
+sub _get_current_service_task {
+    my $service = shift;
+
+    my $servicetasks = Integrations::Echo::force_arrayref($service->{ServiceTasks}, 'ServiceTask');
+    @$servicetasks = grep { $_->{ServiceTaskSchedules} } @$servicetasks;
+    return unless @$servicetasks;
+
+    my $service_name = service_name_override($service);
+    my $today = DateTime->now->set_time_zone(FixMyStreet->local_time_zone);
+    my ($current, $last_date);
+    foreach my $task ( @$servicetasks ) {
+        my $schedules = Integrations::Echo::force_arrayref($task->{ServiceTaskSchedules}, 'ServiceTaskSchedule');
+        foreach my $schedule ( @$schedules ) {
+            my $end = construct_bin_date($schedule->{EndDate});
+
+            next if $last_date && $end && $end < $last_date;
+            next if $end && $end < $today && $service_name ne 'Garden Waste';
+            $last_date = $end;
+            $current = $task;
+        }
+    }
+    return $current;
+}
+
 sub _parse_open_events {
     my $self = shift;
     my $events = shift;
@@ -783,10 +994,12 @@ sub _parse_schedules {
     my $schedules = Integrations::Echo::force_arrayref($servicetask->{ServiceTaskSchedules}, 'ServiceTaskSchedule');
 
     my $today = DateTime->now->set_time_zone(FixMyStreet->local_time_zone)->strftime("%F");
-    my ($min_next, $max_last, $description);
+    my ($min_next, $max_last, $description, $max_end_date);
     foreach my $schedule (@$schedules) {
         my $start_date = construct_bin_date($schedule->{StartDate})->strftime("%F");
         my $end_date = construct_bin_date($schedule->{EndDate})->strftime("%F");
+        $max_end_date = $end_date if !defined($max_end_date) || $max_end_date lt $end_date;
+
         next if $end_date lt $today;
 
         my $next = $schedule->{NextInstance};
@@ -815,17 +1028,11 @@ sub _parse_schedules {
         next => $min_next,
         last => $max_last,
         description => $description,
+        end_date => $max_end_date,
     };
 }
 
-sub _parse_servicetasks {
-    my $unit = shift;
-    my $servicetasks = Integrations::Echo::force_arrayref($unit->{ServiceTasks}, 'ServiceTask');
-    @$servicetasks = grep { $_->{ServiceTaskSchedules} } @$servicetasks;
-    return unless @$servicetasks;
-    # If there is more than one, take first one
-    return $servicetasks->[0];
-}
+sub bin_day_format { '%A, %-d~~~ %B' }
 
 sub bin_future_collections {
     my $self = shift;
@@ -867,11 +1074,15 @@ after the date.
 =cut
 
 sub within_working_days {
-    my ($dt, $days) = @_;
+    my ($dt, $days, $future) = @_;
     my $wd = FixMyStreet::WorkingDays->new(public_holidays => FixMyStreet::Cobrand::UK::public_holidays());
     $dt = $wd->add_days($dt, $days)->ymd;
     my $today = DateTime->now->set_time_zone(FixMyStreet->local_time_zone)->ymd;
-    return $today le $dt;
+    if ( $future ) {
+        return $today ge $dt;
+    } else {
+        return $today le $dt;
+    }
 }
 
 =item waste_fetch_events
@@ -948,6 +1159,7 @@ sub waste_fetch_events {
 sub construct_waste_open311_update {
     my ($self, $cfg, $event) = @_;
 
+    return undef unless $event;
     my $event_type = $cfg->{event_types}{$event->{EventTypeId}} ||= $self->waste_get_event_type($cfg, $event->{EventTypeId});
     my $state_id = $event->{EventStateId};
     my $resolution_id = $event->{ResolutionCodeId} || '';
@@ -1031,7 +1243,7 @@ sub _set_user_source {
 
     my %roles = map { $_->name => 1 } $c->user->obj->roles->all;
     my $source = 9; # Client Officer
-    $source = 3 if $roles{'Contact Centre Agent'}; # Council Contact Centre
+    $source = 3 if $roles{'Contact Centre Agent'} || $roles{'CSC'}; # Council Contact Centre
     $c->set_param('Source', $source);
 }
 
@@ -1048,11 +1260,17 @@ sub waste_munge_request_data {
     $data->{detail} = "Quantity: $quantity\n\n$address";
     $c->set_param('Container_Type', $id);
     $c->set_param('Quantity', $quantity);
-    if ($reason eq 'damaged') {
-        $c->set_param('Action', '2::1'); # Remove/Deliver
-        $c->set_param('Reason', 3); # Damaged
-    } elsif ($reason eq 'stolen' || $reason eq 'taken') {
-        $c->set_param('Reason', 1); # Missing / Stolen
+    if ($id == 44) {
+        if ($reason eq 'damaged') {
+            $c->set_param('Action', '2::1'); # Remove/Deliver
+            $c->set_param('Reason', 3); # Damaged
+        } elsif ($reason eq 'stolen' || $reason eq 'taken') {
+            $c->set_param('Reason', 1); # Missing / Stolen
+        }
+    } else {
+        # Don't want to be remembered from previous loop
+        $c->set_param('Action', '');
+        $c->set_param('Reason', '');
     }
     $self->_set_user_source;
 }
@@ -1083,6 +1301,507 @@ sub waste_munge_enquiry_data {
     $detail .= $address;
     $data->{detail} = $detail;
     $self->_set_user_source;
+}
+sub waste_get_next_dd_day {
+    my $self = shift;
+
+    my $dd_delay = 10; # No days to set up a DD
+
+    my $dt = DateTime->now->set_time_zone(FixMyStreet->local_time_zone);
+    my $wd = FixMyStreet::WorkingDays->new(public_holidays => FixMyStreet::Cobrand::UK::public_holidays());
+
+    my $next_day = $wd->add_days( $dt, $dd_delay );
+
+    return $next_day;
+}
+
+sub waste_get_pro_rata_cost {
+    my ($self, $bins, $end) = @_;
+
+    my $now = DateTime->now->set_time_zone(FixMyStreet->local_time_zone);
+    my $sub_end = DateTime::Format::W3CDTF->parse_datetime($end);
+    my $cost = $bins * $self->{c}->cobrand->waste_get_pro_rata_bin_cost( $sub_end, $now );
+
+    return $cost;
+}
+
+sub waste_get_pro_rata_bin_cost {
+    my ($self, $end, $start) = @_;
+
+    my $weeks = $end->delta_days($start)->in_units('weeks');
+    $weeks -= 1 if $weeks > 0;
+
+    my $base = $self->feature('payment_gateway')->{pro_rata_minimum};
+    my $weekly_cost = $self->feature('payment_gateway')->{pro_rata_weekly};
+
+    my $cost = $base + ( $weeks * $weekly_cost );
+
+    return $cost;
+}
+
+sub waste_sub_due {
+    my ($self, $date) = @_;
+
+    my $now = DateTime->now->set_time_zone(FixMyStreet->local_time_zone);
+    my $sub_end = DateTime::Format::W3CDTF->parse_datetime($date);
+
+    my $diff = $now->delta_days($sub_end)->in_units('weeks');
+    return $diff < 7;
+}
+
+sub waste_sub_overdue {
+    my ($self, $date, $interval, $count) = @_;
+
+    my $now = DateTime->now->set_time_zone(FixMyStreet->local_time_zone)->truncate( to => 'day' );
+    my $sub_end = DateTime::Format::W3CDTF->parse_datetime($date)->truncate( to => 'day' );
+
+    if ( $now > $sub_end ) {
+        my $diff = 1;
+        if ( $interval ) {
+            $diff = $now->delta_days($sub_end)->in_units($interval) < $count;
+        }
+        return $diff;
+    };
+
+    return 0;
+}
+
+sub waste_display_payment_method {
+    my ($self, $method) = @_;
+
+    my $display = {
+        direct_debit => _('Direct Debit'),
+        credit_card => _('Credit Card'),
+    };
+
+    return $display->{$method};
+}
+
+sub garden_waste_cost {
+    my ($self, $bin_count) = @_;
+
+    $bin_count ||= 1;
+
+    return $self->feature('payment_gateway')->{ggw_cost} * $bin_count;
+}
+
+sub waste_payment_type {
+    my ($self, $type, $ref) = @_;
+
+    my ($sub_type, $category);
+    if ( $type eq 'Payment: 01' || $type eq 'First Time' ) {
+        $category = 'Garden Subscription';
+        $sub_type = $self->waste_subscription_types->{New};
+    } elsif ( $type eq 'Payment: 17' || $type eq 'Regular' ) {
+        $category = 'Garden Subscription';
+        if ( $ref ) {
+            $sub_type = $self->waste_subscription_types->{Amend};
+        } else {
+            $sub_type = $self->waste_subscription_types->{Renew};
+        }
+    } elsif ( $type eq 'AUDDIS: 0C' ) {
+        $sub_type = 0;
+        $category = 'Cancel';
+    }
+
+    return ($category, $sub_type);
+}
+
+sub waste_is_dd_payment {
+    my ($self, $row) = @_;
+
+    return $row->get_extra_field_value('payment_method') && $row->get_extra_field_value('payment_method') eq 'direct_debit';
+}
+
+sub waste_dd_paid {
+    my ($self, $date) = @_;
+
+    my ($day, $month, $year) = ( $date =~ m#^(\d+)/(\d+)/(\d+)$#);
+    my $dt = DateTime->new(day => $day, month => $month, year => $year);
+    return within_working_days($dt, 3, 1);
+}
+
+sub waste_reconcile_direct_debits {
+    my $self = shift;
+
+    my $today = DateTime->now;
+    my $start = $today->clone->add( days => -14 );
+
+    my $config = $self->feature('payment_gateway');
+    my $i = Integrations::Pay360->new({
+        config => $config
+    });
+
+    my $recent = $i->get_recent_payments({
+        start => $start,
+        end => $today
+    });
+
+    RECORD: for my $payment ( @$recent ) {
+
+        my $date = $payment->{DueDate};
+        next unless $self->waste_dd_paid($date);
+
+        my ($category, $type) = $self->waste_payment_type ( $payment->{Type}, $payment->{YourRef} );
+
+        next unless $category && $date;
+
+        my $payer = $payment->{PayerReference};
+
+        (my $uprn = $payer) =~ s/^GGW//;
+
+        my $len = length($uprn);
+        my $rs = FixMyStreet::DB->resultset('Problem')->search({
+            extra => { like => '%uprn,T5:value,I' . $len . ':'. $uprn . '%' },
+        },
+        {
+                order_by => { -desc => 'created' }
+        })->to_body( $self->body );
+
+        my $handled;
+
+        # Work out what to do with the payment.
+        # Processed payments are indicated by a matching record with a dd_date the
+        # same as the CollectionDate of the payment
+        #
+        # Renewal is an automatic event so there is never a record in the database
+        # and we have to generate one.
+        #
+        # Cancellations may have an event in the database if the user has cancelled
+        # through the front end but they can also cancel the Direct Debit itself in
+        # which case we need to create a report.
+        #
+        #
+        # If we're a renew payment then find the initial subscription payment, also
+        # checking if we've already processed this payment. If we've not processed it
+        # create a renewal record using the original subscription as a basis.
+        if ( $type && $type eq $self->waste_subscription_types->{Renew} ) {
+            next unless $payment->{Status} eq 'Paid';
+            $rs = $rs->search({ category => 'Garden Subscription' });
+            my $p;
+            # loop over all matching records and pick the most recent new sub or renewal
+            # record. This is where we get the details of the renewal from. There should
+            # always be one of these for an automatic DD renewal. If there isn't then
+            # something has gone wrong and we need to error.
+            while ( my $cur = $rs->next ) {
+                # only match direct debit payments
+                next unless $self->waste_is_dd_payment($cur);
+                # only confirmed records are valid.
+                next unless FixMyStreet::DB::Result::Problem->visible_states()->{$cur->state};
+                my $sub_type = $cur->get_extra_field_value('Subscription_Type');
+                if ( $sub_type eq $self->waste_subscription_types->{New} ) {
+                    $p = $cur if !$p;
+                } elsif ( $sub_type eq $self->waste_subscription_types->{Renew} ) {
+                    # already processed
+                    next RECORD if $cur->get_extra_metadata('dd_date') && $cur->get_extra_metadata('dd_date') eq $date;
+                    # if it's a renewal of a DD where the initial setup was as a renewal
+                    $p = $cur if !$p;
+                }
+            }
+            if ( $p ) {
+                my $service = $self->waste_get_current_garden_sub( $p->get_extra_field_value('property_id') );
+                unless ($service) {
+                    warn "no matching service to renew for $payer\n";
+                    next;
+                }
+                my $renew = _duplicate_waste_report($p, 'Garden Subscription', {
+                    Subscription_Type => $self->waste_subscription_types->{Renew},
+                    service_id => 545,
+                    uprn => $uprn,
+                    Subscription_Details_Container_Type => 44,
+                    Subscription_Details_Quantity => $self->waste_get_sub_quantity($service),
+                    LastPayMethod => $self->bin_payment_types->{direct_debit},
+                    PaymentCode => $payer,
+                } );
+                $renew->set_extra_metadata('dd_date', $date);
+                $renew->confirm;
+                $renew->insert;
+                $handled = 1;
+            }
+        # There's two options with a cancel payment. If the user has cancelled it outside of
+        # WasteWorks then we need to find the original sub and generate a new cancel subscription
+        # report.
+        #
+        # If it's been cancelled inside WasteWorks then we'll have an unconfirmed cancel report
+        # which we need to confirm.
+        } elsif ( $category eq 'Cancel' ) {
+            next unless $payment->{Status} eq 'Processed';
+            $rs = $rs->search({ category => { -in => ['Garden Subscription', 'Cancel Garden Subscription'] } });
+            my ($p, $r);
+            while ( my $cur = $rs->next ) {
+                next unless $self->waste_is_dd_payment($cur);
+                my $sub_type = $cur->get_extra_field_value('Subscription_Type') || '';
+                if ( $sub_type eq $self->waste_subscription_types->{New} ) {
+                    $p = $cur;
+                } elsif ( $cur->category eq 'Cancel Garden Subscription' ) {
+                    if ( $cur->state eq 'unconfirmed' ) {
+                        $r = $cur;
+                    # already processed
+                    } elsif ( $cur->get_extra_metadata('dd_date') && $cur->get_extra_metadata('dd_date') eq $date) {
+                        next RECORD;
+                    }
+                }
+            }
+            if ( $r ) {
+                my $service = $self->waste_get_current_garden_sub( $r->get_extra_field_value('property_id') );
+                # if there's not a service then it's fine as it's already been cancelled
+                if ( $service ) {
+                    $r->set_extra_metadata('dd_date', $date);
+                    $r->confirm;
+                    $r->update;
+                # there's no service but we don't want to be processing the report all the time.
+                } else {
+                    $r->state('hidden');
+                    $r->update;
+                }
+                # regardless this has been handled so no need to alert on it.
+                $handled = 1;
+            } elsif ( $p ) {
+                my $service = $self->waste_get_current_garden_sub( $p->get_extra_field_value('property_id') );
+                unless ($service) {
+                    warn "no matching service to cancel for $payer\n";
+                    next;
+                }
+                my $cancel = _duplicate_waste_report($p, 'Cancel Garden Subscription', {
+                    service_id => 545,
+                    uprn => $uprn,
+                    Container_Instruction_Action => $self->waste_container_actions->{remove},
+                    Container_Instruction_Container_Type => 44,
+                    Container_Instruction_Quantity => $self->waste_get_sub_quantity($service),
+                    LastPayMethod => $self->bin_payment_types->{direct_debit},
+                    PaymentCode => $payer,
+                } );
+                $cancel->set_extra_metadata('dd_date', $date);
+                $cancel->confirm;
+                $cancel->insert;
+                $handled = 1;
+            }
+        # this covers new subscriptions and ad-hoc payments, both of which already have
+        # a record in the database as they are the result of user action
+        } else {
+            next unless $payment->{Status} eq 'Paid';
+            # we fetch the confirmed ones as well as we explicitly want to check for
+            # processed reports so we can warn on those we are missing.
+            $rs = $rs->search({ category => 'Garden Subscription' });
+            while ( my $cur = $rs->next ) {
+                next unless $self->waste_is_dd_payment($cur);
+                if ( my $type = $self->_report_matches_payment( $cur, $payment ) ) {
+                    if ( $cur->state eq 'unconfirmed' && !$handled) {
+                        if ( $type eq 'New' ) {
+                            if ( !$cur->get_extra_metadata('payerReference') ) {
+                                $cur->set_extra_metadata('payerReference', $payer);
+                            }
+                        }
+                        $cur->set_extra_metadata('dd_date', $date);
+                        $cur->update_extra_field( {
+                            name => 'PaymentCode',
+                            description => 'PaymentCode',
+                            value => $payer,
+                        } );
+                        $cur->update_extra_field( {
+                            name => 'LastPayMethod',
+                            description => 'LastPayMethod',
+                            value => $self->bin_payment_types->{direct_debit},
+                        } );
+                        $cur->confirm;
+                        $cur->update;
+                        $handled = 1;
+                    } elsif ( $cur->state eq 'unconfirmed' ) {
+                        # if we've pulled out more that one record, e.g. because they
+                        # failed to make a payment then skip remaining ones.
+                        $cur->state('hidden');
+                        $cur->update;
+                    } elsif ( $cur->get_extra_metadata('dd_date') && $cur->get_extra_metadata('dd_date') eq $date)  {
+                        next RECORD;
+                    }
+                }
+            }
+        }
+
+        unless ( $handled ) {
+            warn "no matching record found for $category payment with id $payer\n";
+        }
+    }
+
+    my $cancelled = $i->get_cancelled_payers({
+        start => $start,
+        end => $today
+    });
+
+    if ( ref $cancelled eq 'HASH' && $cancelled->{error} ) {
+        if ( $cancelled->{error} ne 'No cancelled payers found.' ) {
+            warn $cancelled->{error} . "\n";
+        }
+        return;
+    }
+
+    CANCELLED: for my $payment ( @$cancelled ) {
+
+        my $date = $payment->{CancelledDate};
+
+        next unless $date;
+
+        my $payer = $payment->{Reference};
+
+        (my $uprn = $payer) =~ s/^GGW//;
+
+        my $handled;
+
+        my $len = length($uprn);
+        my $rs = FixMyStreet::DB->resultset('Problem')->search({
+            extra => { like => '%uprn,T5:value,I' . $len . ':'. $uprn . '%' },
+        },
+        {
+                order_by => { -desc => 'created' }
+        })->to_body( $self->body );
+
+        $rs = $rs->search({ category => { -in => ['Garden Subscription', 'Cancel Garden Subscription'] } });
+        my ($p, $r);
+        while ( my $cur = $rs->next ) {
+            my $sub_type = $cur->get_extra_field_value('Subscription_Type') || '';
+            if ( $sub_type eq $self->waste_subscription_types->{New} ) {
+                $p = $cur;
+            } elsif ( $cur->category eq 'Cancel Garden Subscription' ) {
+                if ( $cur->state eq 'unconfirmed' ) {
+                    $r = $cur;
+                # already processed
+                } elsif ( $cur->get_extra_metadata('dd_date') && $cur->get_extra_metadata('dd_date') eq $date) {
+                    next CANCELLED;
+                }
+            }
+        }
+        if ( $r ) {
+            my $service = $self->waste_get_current_garden_sub( $r->get_extra_field_value('property_id') );
+            # if there's not a service then it's fine as it's already been cancelled
+            if ( $service ) {
+                $r->set_extra_metadata('dd_date', $date);
+                $r->confirm;
+                $r->update;
+            # there's no service but we don't want to be processing the report all the time.
+            } else {
+                $r->state('hidden');
+                $r->update;
+            }
+            # regardless this has been handled so no need to alert on it.
+            $handled = 1;
+        } elsif ( $p ) {
+            my $service = $self->waste_get_current_garden_sub( $p->get_extra_field_value('property_id') );
+            unless ($service) {
+                my $hidden = FixMyStreet::DB->resultset('Problem')->search({
+                    category => 'Cancel Garden Subscription',
+                    state => 'hidden',
+                    extra => { like => '%uprn,T5:value,I' . $len . ':'. $uprn . '%' },
+                    created => \" > now() - interval '7' day",
+                });
+                # no service and we're already seen it
+                next if $hidden->count;
+                warn "no matching service to cancel for $payer\n";
+                next;
+            }
+            my $now = DateTime->now->set_time_zone(FixMyStreet->local_time_zone);
+            my $cancel = _duplicate_waste_report($p, 'Cancel Garden Subscription', {
+                service_id => 545,
+                uprn => $uprn,
+                Container_Instruction_Action => $self->waste_container_actions->{remove},
+                Container_Instruction_Container_Type => 44,
+                Container_Instruction_Quantity => $self->waste_get_sub_quantity($service),
+                LastPayMethod => $self->bin_payment_types->{direct_debit},
+                PaymentCode => $payer,
+                Subscription_End_Date => $now->ymd,
+            } );
+            $cancel->title('Garden Subscription - Cancel');
+            $cancel->set_extra_metadata('dd_date', $date);
+            $cancel->confirm;
+            $cancel->insert;
+            $handled = 1;
+        }
+
+        unless ( $handled ) {
+            warn "no matching record found for Cancel payment with id $payer\n";
+        }
+    }
+}
+
+sub _report_matches_payment {
+    my ($self, $r, $p) = @_;
+
+    my $match = 0;
+    if ( $p->{YourRef} && $r->id eq $p->{YourRef} ) {
+        $match = 'Ad-Hoc';
+    } elsif ( !$p->{YourRef}
+            && ( $r->get_extra_field_value('Subscription_Type') eq $self->waste_subscription_types->{New} ||
+                 # if we're renewing a previously non DD sub
+                 $r->get_extra_field_value('Subscription_Type') eq $self->waste_subscription_types->{Renew} )
+    ) {
+        $match = 'New';
+    }
+
+    return $match;
+}
+
+sub _duplicate_waste_report {
+    my ( $report, $category, $extra ) = @_;
+    my $new = FixMyStreet::DB->resultset('Problem')->new({
+        category => $category,
+        user => $report->user,
+        latitude => $report->latitude,
+        longitude => $report->longitude,
+        cobrand => $report->cobrand,
+        bodies_str => $report->bodies_str,
+        title => $report->title,
+        detail => $report->detail,
+        postcode => $report->postcode,
+        used_map => $report->used_map,
+        name => $report->user->name || $report->name,
+        areas => $report->areas,
+        anonymous => $report->anonymous,
+        state => 'unconfirmed',
+        non_public => 1,
+    });
+
+    my @extra = map { { name => $_, value => $extra->{$_} } } keys %$extra;
+    $new->set_extra_fields(@extra);
+
+    return $new;
+}
+
+sub waste_get_current_garden_sub {
+    my ( $self, $id ) = @_;
+
+    my $echo = $self->feature('echo');
+    $echo = Integrations::Echo->new(%$echo);
+    my $services = $echo->GetServiceUnitsForObject( $id );
+    return undef unless $services;
+
+    my $garden;
+    for my $service ( @$services ) {
+        if ( $service->{ServiceId} == $self->garden_waste_service_id ) {
+            $garden = _get_current_service_task($service);
+            last;
+        }
+    }
+
+    return $garden;
+}
+
+sub waste_get_sub_quantity {
+    my ($self, $service) = @_;
+
+    my $quantity = 0;
+    my $tasks = Integrations::Echo::force_arrayref($service->{Data}, 'ExtensibleDatum');
+    return 0 unless scalar @$tasks;
+    for my $data ( @$tasks ) {
+        next unless $data->{DatatypeName} eq 'LBB - GW Container';
+        next unless $data->{ChildData};
+        my $kids = $data->{ChildData}->{ExtensibleDatum};
+        $kids = [ $kids ] if ref $kids eq 'HASH';
+        for my $child ( @$kids ) {
+            next unless $child->{DatatypeName} eq 'Quantity';
+            $quantity = $child->{Value}
+        }
+    }
+
+    return $quantity;
 }
 
 sub admin_templates_external_status_code_hook {
@@ -1194,6 +1913,10 @@ sub dashboard_export_problems_add_columns {
             staff_role => $staff_role,
         };
     });
+}
+
+sub report_form_extras {
+    ( { name => 'private_comments' } )
 }
 
 1;

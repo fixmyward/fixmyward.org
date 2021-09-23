@@ -32,6 +32,7 @@ FixMyStreet::override_config {
 
 my $mech = FixMyStreet::TestMech->new;
 
+
 my $body = $mech->create_body_ok(2494, 'London Borough of Bexley', {
     send_method => 'Open311', api_key => 'key', 'endpoint' => 'e', 'jurisdiction' => 'j' });
 $mech->create_contact_ok(body_id => $body->id, category => 'Abandoned and untaxed vehicles', email => "ConfirmABAN");
@@ -86,6 +87,16 @@ FixMyStreet::override_config {
         $mech->content_contains('Bexley');
     };
 
+    subtest 'cobrand does not show Environment Agency categories' => sub {
+        my $bexley = $mech->create_body_ok(2494, 'London Borough of Bexley');
+        my $environment_agency = $mech->create_body_ok(2494, 'Environment Agency');
+        my $odour_contact = $mech->create_contact_ok(body_id => $environment_agency->id, category => 'Odour', email => 'ics@example.com');
+        my $tree_contact = $mech->create_contact_ok(body_id => $bexley->id, category => 'Trees', email => 'foo@bexley');
+        $mech->get_ok("/report/new/ajax?latitude=51.466707&longitude=0.181108");
+        $mech->content_contains('Trees');
+        $mech->content_lacks('Odour');
+    };
+
     my $report;
     foreach my $test (
         { category => 'Abandoned and untaxed vehicles', email => ['p1confirm'], code => 'ConfirmABAN',
@@ -126,8 +137,8 @@ FixMyStreet::override_config {
         }
 
         subtest 'NSGRef and correct email config' => sub {
-            my $test_data = FixMyStreet::Script::Reports::send();
-            my $req = $test_data->{test_req_used};
+            FixMyStreet::Script::Reports::send();
+            my $req = Open311->test_req_used;
             my $c = CGI::Simple->new($req->content);
             is $c->param('service_code'), $test->{code};
             if ($test->{code} =~ /Confirm/) {
@@ -169,18 +180,19 @@ FixMyStreet::override_config {
     subtest "resending of reports by changing category" => sub {
         $mech->get_ok('/admin/report_edit/' . $report->id);
         $mech->submit_form_ok({ with_fields => { category => 'Damaged road' } });
-        my $test_data = FixMyStreet::Script::Reports::send();
-        my $req = $test_data->{test_req_used};
+        FixMyStreet::Script::Reports::send();
+        my $req = Open311->test_req_used;
         my $c = CGI::Simple->new($req->content);
         is $c->param('service_code'), 'ROAD', 'Report resent in new category';
 
         $mech->submit_form_ok({ with_fields => { category => 'Gulley covers' } });
-        $test_data = FixMyStreet::Script::Reports::send();
-        is_deeply $test_data, {}, 'Report not resent';
+        FixMyStreet::Script::Reports::send();
+        $req = Open311->test_req_used;
+        is_deeply $req, undef, 'Report not resent';
 
         $mech->submit_form_ok({ with_fields => { category => 'Lamp post' } });
-        $test_data = FixMyStreet::Script::Reports::send();
-        $req = $test_data->{test_req_used};
+        FixMyStreet::Script::Reports::send();
+        $req = Open311->test_req_used;
         $c = CGI::Simple->new($req->content);
         is $c->param('service_code'), 'StreetLightingLAMP', 'Report resent';
     };
@@ -200,13 +212,13 @@ FixMyStreet::override_config {
         });
         my $report = $reports[0];
 
-        my $test_data = FixMyStreet::Script::Reports::send();
+        FixMyStreet::Script::Reports::send();
         $report->discard_changes;
         ok $report->whensent, 'Report marked as sent';
         is $report->send_method_used, 'Open311', 'Report sent via Open311';
         is $report->external_id, 248, 'Report has right external ID';
 
-        my $req = $test_data->{test_req_used};
+        my $req = Open311->test_req_used;
         my $c = CGI::Simple->new($req->content);
         is $c->param('attribute[title]'), 'Test Test 1 for ' . $body->id, 'Request had correct title';
         is_deeply [ $c->param('media_url') ], [
@@ -243,6 +255,11 @@ FixMyStreet::override_config {
         }
         $mech->get_ok('/report/new?longitude=0.15356&latitude=51.45556');
         $mech->content_contains('name="private_comments"');
+    };
+
+    subtest 'reference number is shown' => sub {
+        $mech->get_ok('/report/' . $report->id);
+        $mech->content_contains('Report ref:&nbsp;' . $report->id);
     };
 };
 
@@ -281,6 +298,14 @@ $geo->mock('cache', sub {
         ],
     } if $typ eq 'bexley';
 });
+
+subtest 'split postcode overridden' => sub {
+    my $data = FixMyStreet::Cobrand::Bexley->geocode_postcode('DA5 2BD');
+    is_deeply $data, {
+            latitude => 51.431244,
+            longitude => 0.166464,
+        }, 'override postcode';
+};
 
 subtest 'geocoder' => sub {
     my $c = ctx_request('/');
@@ -322,5 +347,7 @@ EOF
     set_fixed_time('2019-12-25T12:00:00Z');
     is $cobrand->_is_out_of_hours(), 1, 'out of hours on bank holiday';
 };
+
+
 
 done_testing();

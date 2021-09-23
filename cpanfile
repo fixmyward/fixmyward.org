@@ -53,6 +53,7 @@ requires 'Cache::Memcached';
 requires 'Carp';
 requires 'Crypt::Eksblowfish::Bcrypt';
 requires 'Crypt::JWT';
+requires 'Crypt::Digest::SHA256';
 requires 'Data::Password::Common';
 requires 'DateTime', '1.51';
 requires 'DateTime::Format::Flexible';
@@ -174,6 +175,7 @@ recommends 'Mac::FSEvents' if $^O eq 'darwin';
 # Modules used by the test suite
 requires 'Test::PostgreSQL', '1.27';
 requires 'CGI::Simple';
+requires 'HTML::Selector::Element';
 requires 'HTTP::Headers';
 requires 'HTTP::Response';
 requires 'LWP::Protocol::PSGI';

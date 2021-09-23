@@ -6,7 +6,7 @@ use utf8;
 
 has addresses => ( is => 'rw');
 
-has default_page_type => ( is => 'ro', isa => 'Str', default => 'Noise' );
+has default_page_type => ( is => 'ro', isa => 'Str', default => 'Wizard' );
 
 before _process_page_array => sub {
     my ($self, $pages) = @_;
@@ -92,7 +92,9 @@ has_page about_you => (
     },
 );
 
-with 'FixMyStreet::App::Form::Noise::AboutYou';
+has email_hint => ( is => 'ro', default => 'We’ll only use this to send you updates on your report' );
+has phone_hint => ( is => 'ro', default => 'We will call you on this number to discuss your report and if necessary arrange a visit' );
+with 'FixMyStreet::App::Form::AboutYou';
 
 has_page best_time => (
     fields => ['best_time', 'best_method', 'continue'],
@@ -592,7 +594,7 @@ has_field submit => ( type => 'Submit', value => 'Submit', element_attr => { cla
 
 sub validate {
     my $self = shift;
-    $self->add_form_error('Please specify at least one of phone or email')
+    $self->add_form_error('Please provide email and/or phone')
         unless $self->field('phone')->is_inactive || $self->field('phone')->value || $self->field('email')->value;
 }
 

@@ -4,6 +4,8 @@ use parent 'FixMyStreet::Cobrand::Whitelabel';
 use strict;
 use warnings;
 use Time::Piece;
+use Moo;
+with 'FixMyStreet::Roles::Open311Multi';
 
 sub council_area_id { 2494 }
 sub council_area { 'Bexley' }
@@ -21,6 +23,20 @@ sub disambiguate_location {
         centre => '51.46088,0.142359',
         bounds => [ 51.408484, 0.074653, 51.515542, 0.2234676 ],
     };
+}
+
+sub geocode_postcode {
+    my ( $self, $s ) = @_;
+
+    # split postcode with a centroid in neighbouring Dartford
+    if ($s =~ /^DA5\s*2BD$/i) {
+        return {
+            latitude => 51.431244,
+            longitude => 0.166464,
+        };
+    }
+
+    return $self->next::method($s);
 }
 
 sub disable_resend_button { 1 }
@@ -66,9 +82,6 @@ sub open311_munge_update_params {
     my ($self, $params, $comment, $body) = @_;
 
     $params->{service_request_id_ext} = $comment->problem->id;
-
-    my $contact = $comment->problem->contact;
-    $params->{service_code} = $contact->email;
 }
 
 sub open311_get_update_munging {
@@ -150,7 +163,7 @@ sub open311_extra_data_include {
 sub admin_user_domain { 'bexley.gov.uk' }
 
 sub open311_post_send {
-    my ($self, $row, $h, $contact) = @_;
+    my ($self, $row, $h, $sender) = @_;
 
     # Check Open311 was successful
     return unless $row->external_id;
@@ -205,6 +218,7 @@ sub open311_post_send {
     }
 
     my @to;
+    my $contact = $sender->contact;
     my $p1_email_to_use = ($contact->email =~ /^Confirm/) ? $emails->{p1confirm} : $emails->{p1};
     push @to, email_list($p1_email_to_use, 'Bexley P1 email') if $p1_email;
     push @to, email_list($emails->{lighting}, 'FixMyStreet Bexley Street Lighting') if $lighting{$row->category};
@@ -216,7 +230,7 @@ sub open311_post_send {
     }
 
     return unless @to;
-    my $sender = FixMyStreet::SendReport::Email->new(
+    my $emailsender = FixMyStreet::SendReport::Email->new(
         use_verp => 0,
         use_replyto => 1,
         to => \@to,
@@ -224,7 +238,7 @@ sub open311_post_send {
 
     $self->open311_config($row, $h, {}, $contact); # Populate NSGRef again if needed
 
-    $sender->send($row, $h);
+    $emailsender->send($row, $h);
 }
 
 sub email_list {

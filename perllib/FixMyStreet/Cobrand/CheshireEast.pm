@@ -168,10 +168,9 @@ around open311_extra_data_include => sub {
 };
 
 sub open311_post_send {
-    my ($self, $row, $h, $contact) = @_;
+    my ($self, $row, $h) = @_;
 
     $row->detail($h->{ce_original_detail});
 }
-
 
 1;

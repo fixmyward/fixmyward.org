@@ -34,6 +34,18 @@ has unique_id_session => ( is => 'ro', isa => 'Maybe[Str]' );
 has unique_id_form => ( is => 'ro', isa => 'Maybe[Str]' );
 has_field unique_id => ( type => 'Hidden', required => 0 );
 
+sub has_page_called {
+    my ($self, $page_name) = @_;
+
+    return grep { $_->name eq $page_name } $self->all_pages;
+}
+
+sub get_params {
+    my ($self, $c) = @_;
+
+    return $c->req->body_params;
+}
+
 sub next {
     my $self = shift;
     my $next = $self->current_page->next;

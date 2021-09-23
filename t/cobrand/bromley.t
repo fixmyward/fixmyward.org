@@ -1,9 +1,13 @@
 use CGI::Simple;
 use Test::MockModule;
 use Test::MockTime qw(:all);
+use Test::Warn;
+use DateTime;
 use Test::Output;
 use FixMyStreet::TestMech;
+use FixMyStreet::SendReport::Open311;
 use FixMyStreet::Script::Reports;
+use Open311::PostServiceRequestUpdates;
 my $mech = FixMyStreet::TestMech->new;
 
 # disable info logs for this test run
@@ -16,11 +20,13 @@ $uk->mock('_fetch_url', sub { '{}' });
 
 # Create test data
 my $user = $mech->create_user_ok( 'bromley@example.com', name => 'Bromley' );
-my $body = $mech->create_body_ok( 2482, 'Bromley Council',
-    { can_be_devolved => 1, send_extended_statuses => 1, comment_user => $user });
+my $body = $mech->create_body_ok( 2482, 'Bromley Council', {
+    can_be_devolved => 1, send_extended_statuses => 1, comment_user => $user,
+    send_method => 'Open311', endpoint => 'http://endpoint.example.com', jurisdiction => 'FMS', api_key => 'test', send_comments => 1
+});
 my $staffuser = $mech->create_user_ok( 'staff@example.com', name => 'Staffie', from_body => $body );
 my $role = FixMyStreet::DB->resultset("Role")->create({
-    body => $body, name => 'Role A', permissions => ['moderate', 'user_edit'] });
+    body => $body, name => 'Role A', permissions => ['moderate', 'user_edit', 'report_mark_private', 'report_inspect', 'contribute_as_body'] });
 $staffuser->add_to_roles($role);
 my $contact = $mech->create_contact_ok(
     body_id => $body->id,
@@ -57,6 +63,9 @@ my @reports = $mech->create_problems_for_body( 1, $body->id, 'Test', {
     cobrand => 'bromley',
     areas => '2482,8141',
     user => $user,
+    send_method_used => 'Open311',
+    whensent => 'now()',
+    external_id => '456',
     extra => {
         contributed_by => $staffuser->id,
     },
@@ -84,6 +93,63 @@ $mech->content_contains( 'State changed to: In progress' );
 $mech->content_contains( 'marks it as unable to fix' );
 $mech->content_contains( 'State changed to: No further action' );
 
+subtest 'Check updates not sent for staff with no text' => sub {
+    my $comment = FixMyStreet::DB->resultset('Comment')->find_or_create( {
+        problem_state => 'unable to fix',
+        problem_id => $report->id,
+        user_id    => $staffuser->id,
+        name       => 'User',
+        mark_fixed => 'f',
+        text       => "",
+        state      => 'confirmed',
+        confirmed  => 'now()',
+        anonymous  => 'f',
+    } );
+    FixMyStreet::override_config {
+        ALLOWED_COBRANDS => 'bromley',
+    }, sub {
+        my $updates = Open311::PostServiceRequestUpdates->new();
+        $updates->send;
+    };
+
+    $comment->discard_changes;
+    is $comment->send_fail_count, 0, "comment sending not attempted";
+    is $comment->get_extra_metadata('cobrand_skipped_sending'), 1, "skipped sending comment";
+};
+
+subtest 'Updates from staff with no text but with private comments are sent' => sub {
+    my $comment = FixMyStreet::DB->resultset('Comment')->find_or_create( {
+        problem_state => 'unable to fix',
+        problem_id => $report->id,
+        user_id    => $staffuser->id,
+        name       => 'User',
+        mark_fixed => 'f',
+        text       => "",
+        state      => 'confirmed',
+        confirmed  => 'now()',
+        anonymous  => 'f',
+    } );
+    $comment->unset_extra_metadata('cobrand_skipped_sending');
+    $comment->set_extra_metadata(private_comments => 'This comment has secret notes');
+    $comment->update;
+    FixMyStreet::override_config {
+        ALLOWED_COBRANDS => 'bromley',
+    }, sub {
+        Open311->_inject_response('/servicerequestupdates.xml', '<?xml version="1.0" encoding="utf-8"?><service_request_updates><request_update><update_id>42</update_id></request_update></service_request_updates>');
+
+        my $updates = Open311::PostServiceRequestUpdates->new();
+        $updates->send;
+
+        $comment->discard_changes;
+        ok $comment->whensent, "comment was sent";
+        ok !$comment->get_extra_metadata('cobrand_skipped_sending'), "didn't skip sending comment";
+
+        my $req = Open311->test_req_used;
+        my $c = CGI::Simple->new($req->content);
+        like $c->param('description'), qr/Private comments: This comment has secret notes/, 'private comments included in update description';
+    };
+};
+
 for my $test (
     {
         desc => 'testing special Open311 behaviour',
@@ -92,7 +158,7 @@ for my $test (
           'attribute[easting]' => 540315,
           'attribute[northing]' => 168935,
           'attribute[service_request_id_ext]' => $report->id,
-          'attribute[report_title]' => 'Test Test 1 for ' . $body->id,
+          'attribute[report_title]' => 'Test Test 1 for ' . $body->id . ' | ROLES: Role A',
           'jurisdiction_id' => 'FMS',
           address_id => undef,
         },
@@ -116,7 +182,7 @@ for my $test (
         feature_id => '1234',
         expected => {
           'attribute[service_request_id_ext]' => $report->id,
-          'attribute[report_title]' => 'Test Test 1 for ' . $body->id . ' | ID: 1234',
+          'attribute[report_title]' => 'Test Test 1 for ' . $body->id . ' | ID: 1234 | ROLES: Role A',
         },
     },
 ) {
@@ -126,26 +192,107 @@ for my $test (
         $report->set_extra_fields({ name => 'feature_id', value => $test->{feature_id} })
             if $test->{feature_id};
         $report->update;
-        $body->update( { send_method => 'Open311', endpoint => 'http://bromley.endpoint.example.com', jurisdiction => 'FMS', api_key => 'test', send_comments => 1 } );
-        my $test_data;
         FixMyStreet::override_config {
             STAGING_FLAGS => { send_reports => 1 },
             ALLOWED_COBRANDS => [ 'fixmystreet', 'bromley' ],
             MAPIT_URL => 'http://mapit.uk/',
         }, sub {
-            $test_data = FixMyStreet::Script::Reports::send();
+            FixMyStreet::Script::Reports::send();
         };
         $report->discard_changes;
         ok $report->whensent, 'Report marked as sent';
         is $report->send_method_used, 'Open311', 'Report sent via Open311';
         is $report->external_id, 248, 'Report has right external ID';
 
-        my $req = $test_data->{test_req_used};
+        my $req = Open311->test_req_used;
         my $c = CGI::Simple->new($req->content);
         is $c->param($_), $test->{expected}->{$_}, "Request had correct $_"
             for keys %{$test->{expected}};
     };
 }
+
+subtest 'ensure private_comments are added to open311 description' => sub {
+    $report->set_extra_metadata(private_comments => 'Secret notes go here');
+    $report->whensent(undef);
+    $report->update;
+
+    FixMyStreet::override_config {
+        STAGING_FLAGS => { send_reports => 1 },
+        ALLOWED_COBRANDS => [ 'fixmystreet', 'bromley' ],
+        MAPIT_URL => 'http://mapit.uk/',
+    }, sub {
+        FixMyStreet::Script::Reports::send();
+    };
+
+    $report->discard_changes;
+    ok $report->whensent, 'Report marked as sent';
+    unlike $report->detail, qr/Private comments/, 'private comments not saved to report detail';
+
+    my $req = Open311->test_req_used;
+    my $c = CGI::Simple->new($req->content);
+    like $c->param('description'), qr/Private comments: Secret notes go here/, 'private comments included in description';
+};
+
+subtest 'test waste duplicate' => sub {
+    my $sender = FixMyStreet::SendReport::Open311->new(
+        bodies => [ $body ], body_config => { $body->id => $body },
+    );
+    Open311->_inject_response('/requests.xml', '<?xml version="1.0" encoding="utf-8"?><errors><error><code></code><description>Missed Collection event already open for the property</description></error></errors>', 500);
+    FixMyStreet::override_config {
+        ALLOWED_COBRANDS => 'bromley',
+    }, sub {
+        $sender->send($report, {
+            easting => 1,
+            northing => 2,
+            url => 'http://example.org/',
+        });
+    };
+    is $report->state, 'duplicate', 'State updated';
+};
+
+subtest 'Private comments on updates are added to open311 description' => sub {
+    FixMyStreet::override_config {
+        ALLOWED_COBRANDS => ['bromley', 'tfl'],
+    }, sub {
+        $report->comments->delete;
+
+        Open311->_inject_response('/servicerequestupdates.xml', '<?xml version="1.0" encoding="utf-8"?><service_request_updates><request_update><update_id>42</update_id></request_update></service_request_updates>');
+
+        $mech->log_out_ok;
+        $mech->log_in_ok($staffuser->email);
+        $mech->host('bromley.fixmystreet.com');
+
+        $mech->get_ok('/report/' . $report->id);
+
+        $mech->submit_form_ok( {
+                with_fields => {
+                    submit_update => 1,
+                    update => 'Test',
+                    private_comments => 'Secret update notes',
+                    fms_extra_title => 'DR',
+                    first_name => 'Bromley',
+                    last_name => 'Council',
+                },
+            },
+            'update form submitted'
+        );
+
+        is $report->comments->count, 1, 'comment was added';
+        my $comment = $report->comments->first;
+        is $comment->get_extra_metadata('private_comments'), 'Secret update notes', 'private comments saved to comment';
+
+        my $updates = Open311::PostServiceRequestUpdates->new();
+        $updates->send;
+
+        $comment->discard_changes;
+        ok $comment->whensent, 'Comment marked as sent';
+        unlike $comment->text, qr/Private comments/, 'private comments not saved to update text';
+
+        my $req = Open311->test_req_used;
+        my $c = CGI::Simple->new($req->content);
+        like $c->param('description'), qr/Private comments: Secret update notes/, 'private comments included in update description';
+    };
+};
 
 for my $test (
     {
@@ -225,6 +372,23 @@ subtest 'check display of TfL and waste reports' => sub {
     $mech->content_lacks('Report missed collection');
 };
 
+subtest 'check staff can filter on waste reports' => sub {
+    FixMyStreet::override_config {
+        ALLOWED_COBRANDS => ['bromley', 'tfl'],
+        MAPIT_URL => 'http://mapit.uk/',
+    }, sub {
+        $mech->host('bromley.fixmystreet.com');
+        $mech->get_ok( '/reports/Bromley');
+        $mech->content_lacks('<optgroup label="Waste"');
+
+        $mech->log_in_ok($staffuser->email);
+        $mech->get_ok( '/reports/Bromley');
+        $mech->content_contains('<optgroup label="Waste"');
+        $mech->get_ok( '/report/' . $report->id );
+        $mech->content_contains('<option value="Report missed collection">');
+    };
+};
+
 subtest 'check geolocation overrides' => sub {
     my $cobrand = FixMyStreet::Cobrand::Bromley->new;
     foreach my $test (
@@ -289,6 +453,7 @@ subtest 'check heatmap page' => sub {
 FixMyStreet::override_config {
     ALLOWED_COBRANDS => 'bromley',
     COBRAND_FEATURES => {
+        payment_gateway => { bromley => { ggw_cost => 1000 } },
         echo => { bromley => { sample_data => 1 } },
         waste => { bromley => 1 }
     },
@@ -359,6 +524,30 @@ FixMyStreet::override_config {
         $mech->content_lacks('Report a non-recyclable refuse collection');
         restore_time();
     };
+
+    subtest 'test requesting garden waste' => sub {
+		my $echo = Test::MockModule->new('Integrations::Echo');
+        $echo->mock('GetServiceUnitsForObject', sub {
+            return [ {
+                Id => 1005,
+                ServiceId => 545,
+                ServiceName => 'Garden waste collection',
+                ServiceTasks => { ServiceTask => {
+                    Id => 405,
+                    Data => { ExtensibleDatum => [ { DatatypeName => 'LBB - GW Container', ChildData => { ExtensibleDatum => { DatatypeName => 'Quantity', Value => 1, } }, } ] },
+                    ServiceTaskSchedules => { ServiceTaskSchedule => [ {
+                        StartDate => { DateTime => '2019-04-01T23:00:00Z' },
+                        EndDate => { DateTime => '2050-05-14T23:00:00Z' },
+                        LastInstance => { OriginalScheduledDate => { DateTime => '2020-05-18T00:00:00Z' }, CurrentScheduledDate => { DateTime => '2020-05-18T00:00:00Z' }, Ref => { Value => { anyType => [ 567, 890 ] } }, },
+                        NextInstance => undef,
+                    } ] },
+                } },
+            } ]
+        } );
+        $mech->get_ok('/waste/12345');
+        $mech->content_lacks('Request a replacement garden waste container');
+    };
+
 };
 
 subtest 'test waste max-per-day' => sub {
@@ -370,6 +559,7 @@ subtest 'test waste max-per-day' => sub {
                 max_properties_per_day => 1,
                 sample_data => 1
             } },
+            payment_gateway => { bromley => { ggw_cost => 1000 } },
             waste => { bromley => 1 }
         },
     }, sub {
@@ -630,5 +820,961 @@ subtest 'parks lookup' => sub {
         $mech->content_contains('51.3396');
     };
 };
+
+subtest 'check_within_days' => sub {
+    for my $test (
+        {
+            today => '2021-03-19',
+            check => '2021-03-18',
+            days => 1,
+            is_true => 1,
+            name => 'tomorrow',
+        },
+        {
+            today => '2021-03-19',
+            check => '2021-03-17',
+            days => 1,
+            is_true => 0,
+            name => 'day after tomorrow',
+        },
+        {
+            today => '2021-03-22',
+            check => '2021-03-19',
+            days => 1,
+            is_true => 1,
+            name => 'over weekend',
+        },
+        {
+            today => '2021-03-23',
+            check => '2021-03-19',
+            days => 1,
+            is_true => 0,
+            name => 'tuesday',
+        },
+        {
+            today => '2021-03-23',
+            check => '2021-03-19',
+            days => 1,
+            is_true => 1,
+            name => 'tuesday future',
+            future => 1,
+        },
+        {
+            today => '2021-03-18',
+            check => '2021-03-17',
+            days => 2,
+            is_true => 0,
+            name => 'day after tomorrow future',
+            future => 1,
+        },
+        {
+            today => '2021-03-20',
+            check => '2021-03-19',
+            days => 1,
+            is_true => 0,
+            name => 'saturday not ahead of friday',
+            future => 1,
+        },
+    ) {
+        subtest $test->{name} => sub {
+            set_fixed_time($test->{today} . 'T12:00:00Z');
+            my $date = DateTime::Format::W3CDTF->parse_datetime($test->{check});
+
+            if ( $test->{is_true} ) {
+                ok FixMyStreet::Cobrand::Bromley::within_working_days($date, $test->{days}, $test->{future});
+            } else {
+                ok !FixMyStreet::Cobrand::Bromley::within_working_days($date, $test->{days}, $test->{future});
+            }
+
+        };
+    }
+};
+
+subtest 'check pro-rata calculation' => sub {
+    FixMyStreet::override_config {
+        ALLOWED_COBRANDS => 'bromley',
+        COBRAND_FEATURES => {
+            payment_gateway => {
+                bromley => {
+                    ggw_cost => 2000,
+                    pro_rata_weekly => 86,
+                    pro_rata_minimum => 1586,
+                }
+            }
+        },
+    }, sub {
+        my $c = FixMyStreet::Cobrand::Bromley->new;
+
+        my $start = DateTime->new(
+            year => 2021,
+            month => 02,
+            day => 19
+        );
+
+        for my $test (
+            {
+                year => 2021,
+                month => 2,
+                day => 23,
+                expected => 1586,
+                desc => '4 days remaining',
+            },
+            {
+                year => 2021,
+                month => 2,
+                day => 26,
+                expected => 1586,
+                desc => 'one week remaining',
+            },
+            {
+                year => 2021,
+                month => 3,
+                day => 5,
+                expected => 1672,
+                desc => 'two weeks remaining',
+            },
+            {
+                year => 2021,
+                month => 3,
+                day => 8,
+                expected => 1672,
+                desc => 'two and a half weeks remaining',
+            },
+            {
+                year => 2021,
+                month => 8,
+                day => 19,
+                expected => 3650,
+                desc => '25 weeks remaining',
+            },
+            {
+                year => 2022,
+                month => 2,
+                day => 14,
+                expected => 5886,
+                desc => '51 weeks remaining',
+            },
+        ) {
+
+            my $end = DateTime->new(
+                year => $test->{year},
+                month => $test->{month},
+                day => $test->{day},
+            );
+
+            is $c->waste_get_pro_rata_bin_cost($end, $start), $test->{expected}, $test->{desc};
+        }
+    };
+};
+
+subtest 'check direct debit reconcilliation' => sub {
+    set_fixed_time('2021-03-19T12:00:00Z'); # After sample food waste collection
+    my $echo = Test::MockModule->new('Integrations::Echo');
+    $echo->mock('GetServiceUnitsForObject' => sub {
+        my ($self, $id) = @_;
+
+        if ( $id == 54321 ) {
+            return [ {
+                Id => 1005,
+                ServiceId => 545,
+                ServiceName => 'Garden waste collection',
+                ServiceTasks => { ServiceTask => {
+                    Id => 405,
+                    ScheduleDescription => 'every other Monday',
+                    Data => { ExtensibleDatum => [ {
+                        DatatypeName => 'LBB - GW Container',
+                        ChildData => { ExtensibleDatum => {
+                            DatatypeName => 'Quantity',
+                            Value => 2,
+                        } },
+                    } ] },
+                    ServiceTaskSchedules => { ServiceTaskSchedule => [ {
+                        EndDate => { DateTime => '2020-01-01T00:00:00Z' },
+                        LastInstance => {
+                            OriginalScheduledDate => { DateTime => '2019-12-31T00:00:00Z' },
+                            CurrentScheduledDate => { DateTime => '2019-12-31T00:00:00Z' },
+                        },
+                    }, {
+                        EndDate => { DateTime => '2021-03-30T00:00:00Z' },
+                        NextInstance => {
+                            CurrentScheduledDate => { DateTime => '2020-06-01T00:00:00Z' },
+                            OriginalScheduledDate => { DateTime => '2020-06-01T00:00:00Z' },
+                        },
+                        LastInstance => {
+                            OriginalScheduledDate => { DateTime => '2020-05-18T00:00:00Z' },
+                            CurrentScheduledDate => { DateTime => '2020-05-18T00:00:00Z' },
+                            Ref => { Value => { anyType => [ 567, 890 ] } },
+                        },
+                    }
+                ] }
+            } } } ];
+        }
+        if ( $id == 54322 || $id == 54324 || $id == 84324 || $id == 154323 ) {
+            return [ {
+                Id => 1005,
+                ServiceId => 545,
+                ServiceName => 'Garden waste collection',
+                ServiceTasks => { ServiceTask => {
+                    Id => 405,
+                    ScheduleDescription => 'every other Monday',
+                    Data => { ExtensibleDatum => [ {
+                        DatatypeName => 'LBB - GW Container',
+                        ChildData => { ExtensibleDatum => {
+                            DatatypeName => 'Quantity',
+                            Value => 1,
+                        } },
+                    } ] },
+                    ServiceTaskSchedules => { ServiceTaskSchedule => [ {
+                        EndDate => { DateTime => '2020-01-01T00:00:00Z' },
+                        LastInstance => {
+                            OriginalScheduledDate => { DateTime => '2019-12-31T00:00:00Z' },
+                            CurrentScheduledDate => { DateTime => '2019-12-31T00:00:00Z' },
+                        },
+                    }, {
+                        EndDate => { DateTime => '2021-03-30T00:00:00Z' },
+                        NextInstance => {
+                            CurrentScheduledDate => { DateTime => '2020-06-01T00:00:00Z' },
+                            OriginalScheduledDate => { DateTime => '2020-06-01T00:00:00Z' },
+                        },
+                        LastInstance => {
+                            OriginalScheduledDate => { DateTime => '2020-05-18T00:00:00Z' },
+                            CurrentScheduledDate => { DateTime => '2020-05-18T00:00:00Z' },
+                            Ref => { Value => { anyType => [ 567, 890 ] } },
+                        },
+                    }
+                ] }
+            } } } ];
+        }
+        if ( $id == 8854321 ) {
+            return [ {
+                Id => 1005,
+                ServiceId => 545,
+                ServiceName => 'Garden waste collection',
+                ServiceTasks => { ServiceTask => {
+                    Id => 405,
+                    ScheduleDescription => 'every other Monday',
+                    Data => { ExtensibleDatum => '' },
+                    ServiceTaskSchedules => { ServiceTaskSchedule => [ {
+                        EndDate => { DateTime => '2020-01-01T00:00:00Z' },
+                        LastInstance => {
+                            OriginalScheduledDate => { DateTime => '2019-12-31T00:00:00Z' },
+                            CurrentScheduledDate => { DateTime => '2019-12-31T00:00:00Z' },
+                        },
+                    }, {
+                        EndDate => { DateTime => '2021-03-30T00:00:00Z' },
+                        NextInstance => {
+                            CurrentScheduledDate => { DateTime => '2020-06-01T00:00:00Z' },
+                            OriginalScheduledDate => { DateTime => '2020-06-01T00:00:00Z' },
+                        },
+                        LastInstance => {
+                            OriginalScheduledDate => { DateTime => '2020-05-18T00:00:00Z' },
+                            CurrentScheduledDate => { DateTime => '2020-05-18T00:00:00Z' },
+                            Ref => { Value => { anyType => [ 567, 890 ] } },
+                        },
+                    }
+                ] }
+            } } } ];
+        }
+    });
+
+    my $ad_hoc_orig = setup_dd_test_report({
+        'Subscription_Type' => 1,
+        'Subscription_Details_Quantity' => 1,
+        'payment_method' => 'direct_debit',
+        'property_id' => '54325',
+        'uprn' => '654325',
+    });
+    $ad_hoc_orig->set_extra_metadata('dd_date', '01/01/2021');
+    $ad_hoc_orig->update;
+
+    my $ad_hoc = setup_dd_test_report({
+        'Subscription_Type' => 3,
+        'Subscription_Details_Quantity' => 1,
+        'payment_method' => 'direct_debit',
+        'property_id' => '54325',
+        'uprn' => '654325',
+    });
+    $ad_hoc->state('unconfirmed');
+    $ad_hoc->update;
+
+    my $ad_hoc_processed = setup_dd_test_report({
+        'Subscription_Type' => 3,
+        'Subscription_Details_Quantity' => 1,
+        'payment_method' => 'direct_debit',
+        'property_id' => '54426',
+        'uprn' => '654326',
+    });
+    $ad_hoc_processed->set_extra_metadata('dd_date' => '16/03/2021');
+    $ad_hoc_processed->update;
+
+    my $ad_hoc_skipped = setup_dd_test_report({
+        'Subscription_Type' => 3,
+        'Subscription_Details_Quantity' => 1,
+        'payment_method' => 'direct_debit',
+        'property_id' => '94325',
+        'uprn' => '954325',
+    });
+    $ad_hoc_skipped->state('unconfirmed');
+    $ad_hoc_skipped->update;
+
+    my $hidden = setup_dd_test_report({
+        'Subscription_Type' => 1,
+        'Subscription_Details_Quantity' => 1,
+        'payment_method' => 'direct_debit',
+        'property_id' => '54399',
+        'uprn' => '554399',
+    });
+    $hidden->state('hidden');
+    $hidden->update;
+
+    my $cc_to_ignore = setup_dd_test_report({
+        'Subscription_Type' => 1,
+        'Subscription_Details_Quantity' => 1,
+        'payment_method' => 'credit_card',
+        'property_id' => '54399',
+        'uprn' => '554399',
+    });
+    $cc_to_ignore->state('unconfirmed');
+    $cc_to_ignore->update;
+
+    my $integ = Test::MockModule->new('Integrations::Pay360');
+    $integ->mock('config', sub { return { dd_sun => 'sun', dd_client_id => 'client' }; } );
+    $integ->mock('call', sub {
+        my ($self, $method) = @_;
+
+        if ( $method eq 'GetPaymentHistoryAllPayersWithDates' ) {
+        return {
+            GetPaymentHistoryAllPayersWithDatesResponse => {
+            GetPaymentHistoryAllPayersWithDatesResult => {
+                AuthStatus => "true",
+                OverallStatus => "true",
+                StatusCode => "SA",
+                StatusMessage => "Success: Payments retrieved",
+                Payments => {
+                    PaymentAPI => [
+                        {   # new sub
+                            AlternateKey => "",
+                            Amount => 10.00,
+                            ClientName => "London Borough of Bromley",
+                            CollectionDate => "16/03/2021",
+                            DueDate => "16/03/2021",
+                            PayerAccountHoldersName => "A Payer",
+                            PayerAccountNumber => 123,
+                            PayerName => "A Payer",
+                            PayerReference => "GGW654321",
+                            PayerSortCode => "12345",
+                            ProductName => "Garden Waste",
+                            Status => "Paid",
+                            Type => "First Time",
+                        },
+                        {   # unhandled new sub
+                            AlternateKey => "",
+                            Amount => 10.00,
+                            ClientName => "London Borough of Bromley",
+                            CollectionDate => "16/03/2021",
+                            DueDate => "16/03/2021",
+                            PayerAccountHoldersName => "A Payer",
+                            PayerAccountNumber => 123,
+                            PayerName => "A Payer",
+                            PayerReference => "GGW554321",
+                            PayerSortCode => "12345",
+                            ProductName => "Garden Waste",
+                            Status => "Paid",
+                            Type => "First Time",
+                        },
+                        {   # hidden new sub
+                            AlternateKey => "",
+                            Amount => 10.00,
+                            ClientName => "London Borough of Bromley",
+                            CollectionDate => "16/03/2021",
+                            DueDate => "16/03/2021",
+                            PayerAccountHoldersName => "A Payer",
+                            PayerAccountNumber => 123,
+                            PayerName => "A Payer",
+                            PayerReference => "GGW554399",
+                            PayerSortCode => "12345",
+                            ProductName => "Garden Waste",
+                            Status => "Paid",
+                            Type => "First Time",
+                        },
+                        {   # ad hoc already processed
+                            AlternateKey => "",
+                            YourRef => $ad_hoc_processed->id,
+                            Amount => 10.00,
+                            ClientName => "London Borough of Bromley",
+                            CollectionDate => "16/03/2021",
+                            DueDate => "16/03/2021",
+                            PayerAccountHoldersName => "A Payer",
+                            PayerAccountNumber => 123,
+                            PayerName => "A Payer",
+                            PayerReference => "GGW654326",
+                            PayerSortCode => "12345",
+                            ProductName => "Garden Waste",
+                            Status => "Paid",
+                            Type => "Regular",
+                        },
+                        {   # renewal
+                            AlternateKey => "",
+                            Amount => 10.00,
+                            ClientName => "London Borough of Bromley",
+                            CollectionDate => "16/03/2021",
+                            DueDate => "16/03/2021",
+                            PayerAccountHoldersName => "A Payer",
+                            PayerAccountNumber => 123,
+                            PayerName => "A Payer",
+                            PayerReference => "GGW654322",
+                            PayerSortCode => "12345",
+                            ProductName => "Garden Waste",
+                            Status => "Paid",
+                            Type => "Regular",
+                        },
+                        {   # renewal already handled
+                            AlternateKey => "",
+                            Amount => 10.00,
+                            ClientName => "London Borough of Bromley",
+                            CollectionDate => "16/03/2021",
+                            DueDate => "16/03/2021",
+                            PayerAccountHoldersName => "A Payer",
+                            PayerAccountNumber => 123,
+                            PayerName => "A Payer",
+                            PayerReference => "GGW654324",
+                            PayerSortCode => "12345",
+                            ProductName => "Garden Waste",
+                            Status => "Paid",
+                            Type => "Regular",
+                        },
+                        {   # renewal but payment too new
+                            AlternateKey => "",
+                            Amount => 10.00,
+                            ClientName => "London Borough of Bromley",
+                            CollectionDate => "18/03/2021",
+                            DueDate => "19/03/2021",
+                            PayerAccountHoldersName => "A Payer",
+                            PayerAccountNumber => 123,
+                            PayerName => "A Payer",
+                            PayerReference => "GGW654329",
+                            PayerSortCode => "12345",
+                            ProductName => "Garden Waste",
+                            Status => "Paid",
+                            Type => "Regular",
+                        },
+                        {   # renewal but nothing in echo
+                            AlternateKey => "",
+                            Amount => 10.00,
+                            ClientName => "London Borough of Bromley",
+                            CollectionDate => "16/03/2021",
+                            DueDate => "16/03/2021",
+                            PayerAccountHoldersName => "A Payer",
+                            PayerAccountNumber => 123,
+                            PayerName => "A Payer",
+                            PayerReference => "GGW754322",
+                            PayerSortCode => "12345",
+                            ProductName => "Garden Waste",
+                            Status => "Paid",
+                            Type => "Payment: 17",
+                        },
+                        {   # renewal but nothing in fms
+                            AlternateKey => "",
+                            Amount => 10.00,
+                            ClientName => "London Borough of Bromley",
+                            CollectionDate => "16/03/2021",
+                            DueDate => "16/03/2021",
+                            PayerAccountHoldersName => "A Payer",
+                            PayerAccountNumber => 123,
+                            PayerName => "A Payer",
+                            PayerReference => "GGW854324",
+                            PayerSortCode => "12345",
+                            ProductName => "Garden Waste",
+                            Status => "Paid",
+                            Type => "Regular",
+                        },
+                        {   # subsequent renewal from a cc sub
+                            AlternateKey => "",
+                            Amount => 10.00,
+                            ClientName => "London Borough of Bromley",
+                            CollectionDate => "16/03/2021",
+                            DueDate => "16/03/2021",
+                            PayerAccountHoldersName => "A Payer",
+                            PayerAccountNumber => 123,
+                            PayerName => "A Payer",
+                            PayerReference => "GGW3654321",
+                            PayerSortCode => "12345",
+                            ProductName => "Garden Waste",
+                            Status => "Paid",
+                            Type => "Regular",
+                        },
+                        {   # renewal from cc payment
+                            AlternateKey => "",
+                            Amount => 10.00,
+                            ClientName => "London Borough of Bromley",
+                            CollectionDate => "27/02/2021",
+                            DueDate => "15/03/2021",
+                            PayerAccountHoldersName => "A Payer",
+                            PayerAccountNumber => 123,
+                            PayerName => "A Payer",
+                            PayerReference => "GGW1654321",
+                            PayerSortCode => "12345",
+                            ProductName => "Garden Waste",
+                            Status => "Paid",
+                            Type => "Payment: 01",
+                        },
+                        {   # ad hoc
+                            AlternateKey => "",
+                            YourRef => $ad_hoc->id,
+                            Amount => 10.00,
+                            ClientName => "London Borough of Bromley",
+                            CollectionDate => "14/03/2021",
+                            DueDate => "16/03/2021",
+                            PayerAccountHoldersName => "A Payer",
+                            PayerAccountNumber => 123,
+                            PayerName => "A Payer",
+                            PayerReference => "GGW654325",
+                            PayerSortCode => "12345",
+                            ProductName => "Garden Waste",
+                            Status => "Paid",
+                            Type => "Regular",
+                        },
+                        {   # unhandled new sub, ad hoc with same uprn
+                            AlternateKey => "",
+                            Amount => 10.00,
+                            ClientName => "London Borough of Bromley",
+                            CollectionDate => "16/03/2021",
+                            DueDate => "16/03/2021",
+                            PayerAccountHoldersName => "A Payer",
+                            PayerAccountNumber => 123,
+                            PayerName => "A Payer",
+                            PayerReference => "GGW954325",
+                            PayerSortCode => "12345",
+                            ProductName => "Garden Waste",
+                            Status => "Paid",
+                            Type => "First Time",
+                        },
+                    ]
+                }
+            }}};
+        } elsif ( $method eq 'GetCancelledPayerReport' ) {
+            return => {
+                GetCancelledPayerReportResponse => {
+                    GetCancelledPayerReportResult => {
+                        StatusCode => 'SA',
+                        OverallStatus => 'true',
+                        StatusMessage => "Success: cancelled payers retrieved",
+                        CancelledPayerRecords => {
+                            CancelledPayerRecordAPI => [
+                                {   # cancel
+                                    AlternateKey => "",
+                                    Amount => 10.00,
+                                    ClientName => "London Borough of Bromley",
+                                    CollectionDate => "26/02/2021",
+                                    CancelledDate => "26/02/2021",
+                                    PayerAccountHoldersName => "A Payer",
+                                    PayerAccountNumber => 123,
+                                    PayerName => "A Payer",
+                                    Reference => "GGW654323",
+                                    PayerSortCode => "12345",
+                                    ProductName => "Garden Waste",
+                                    Status => "Processed",
+                                    Type => "AUDDIS: 0C",
+                                },
+                                {   # unhandled cancel
+                                    AlternateKey => "",
+                                    Amount => 10.00,
+                                    ClientName => "London Borough of Bromley",
+                                    CollectionDate => "21/02/2021",
+                                    CancelledDate => "26/02/2021",
+                                    PayerAccountHoldersName => "A Payer",
+                                    PayerAccountNumber => 123,
+                                    PayerName => "A Payer",
+                                    Reference => "GGW954326",
+                                    PayerSortCode => "12345",
+                                    ProductName => "Garden Waste",
+                                    Status => "Processed",
+                                    Type => "AUDDIS: 0C",
+                                },
+                                {   # unprocessed cancel
+                                    AlternateKey => "",
+                                    Amount => 10.00,
+                                    ClientName => "London Borough of Bromley",
+                                    CollectionDate => "21/02/2021",
+                                    CancelledDate => "21/02/2021",
+                                    PayerAccountHoldersName => "A Payer",
+                                    PayerAccountNumber => 123,
+                                    PayerName => "A Payer",
+                                    Reference => "GGW854325",
+                                    PayerSortCode => "12345",
+                                    ProductName => "Garden Waste",
+                                    Status => "Processed",
+                                    Type => "AUDDIS: 0C",
+                                },
+                                {   # cancel nothing in echo
+                                    AlternateKey => "",
+                                    Amount => 10.00,
+                                    ClientName => "London Borough of Bromley",
+                                    CollectionDate => "21/02/2021",
+                                    CancelledDate => "26/02/2021",
+                                    PayerAccountHoldersName => "A Payer",
+                                    PayerAccountNumber => 123,
+                                    PayerName => "A Payer",
+                                    Reference => "GGW954324",
+                                    PayerSortCode => "12345",
+                                    ProductName => "Garden Waste",
+                                    Status => "Processed",
+                                    Type => "AUDDIS: 0C",
+                                },
+                                {   # cancel no extended data
+                                    AlternateKey => "",
+                                    Amount => 10.00,
+                                    ClientName => "London Borough of Bromley",
+                                    CollectionDate => "26/02/2021",
+                                    CancelledDate => "26/02/2021",
+                                    PayerAccountHoldersName => "A Payer",
+                                    PayerAccountNumber => 123,
+                                    PayerName => "A Payer",
+                                    Reference => "GGW6654326",
+                                    PayerSortCode => "12345",
+                                    ProductName => "Garden Waste",
+                                    Status => "Processed",
+                                    Type => "AUDDIS: 0C",
+                                },
+                            ]
+                        }
+                    }
+                }
+            };
+        }
+    });
+
+    my $contact = $mech->create_contact_ok(body => $body, category => 'Garden Subscription', email => 'garden@example.com');
+    $contact->set_extra_fields(
+            { name => 'uprn', required => 1, automated => 'hidden_field' },
+            { name => 'property_id', required => 1, automated => 'hidden_field' },
+            { name => 'service_id', required => 0, automated => 'hidden_field' },
+            { name => 'Subscription_Type', required => 1, automated => 'hidden_field' },
+            { name => 'Subscription_Details_Quantity', required => 1, automated => 'hidden_field' },
+            { name => 'Subscription_Details_Container_Type', required => 1, automated => 'hidden_field' },
+            { name => 'Container_Instruction_Quantity', required => 1, automated => 'hidden_field' },
+            { name => 'Container_Instruction_Action', required => 1, automated => 'hidden_field' },
+            { name => 'Container_Instruction_Container_Type', required => 1, automated => 'hidden_field' },
+            { name => 'current_containers', required => 1, automated => 'hidden_field' },
+            { name => 'new_containers', required => 1, automated => 'hidden_field' },
+            { name => 'payment_method', required => 1, automated => 'hidden_field' },
+            { name => 'pro_rata', required => 0, automated => 'hidden_field' },
+            { name => 'payment', required => 1, automated => 'hidden_field' },
+            { name => 'client_reference', required => 1, automated => 'hidden_field' },
+    );
+    $contact->update;
+
+    my $sub_for_renewal = setup_dd_test_report({
+        'Subscription_Type' => 1,
+        'Subscription_Details_Quantity' => 1,
+        'payment_method' => 'direct_debit',
+        'property_id' => '54321',
+        'uprn' => '654322',
+    });
+
+    my $sub_for_cancel = setup_dd_test_report({
+        'Subscription_Type' => 1,
+        'Subscription_Details_Quantity' => 1,
+        'payment_method' => 'direct_debit',
+        'property_id' => '54322',
+        'uprn' => '654323',
+    });
+
+    my $sub_for_cancel_no_extended_data = setup_dd_test_report({
+        'Subscription_Type' => 1,
+        'Subscription_Details_Quantity' => 1,
+        'payment_method' => 'direct_debit',
+        'property_id' => '8854321',
+        'uprn' => '6654326',
+    });
+
+    # e.g if they tried to create a DD but the process failed
+    my $failed_new_sub = setup_dd_test_report({
+        'Subscription_Type' => 1,
+        'Subscription_Details_Quantity' => 1,
+        'payment_method' => 'direct_debit',
+        'property_id' => '54323',
+        'uprn' => '654321',
+    });
+    $failed_new_sub->state('unconfirmed');
+    $failed_new_sub->created(\" created - interval '2' second");
+    $failed_new_sub->update;
+
+    my $new_sub = setup_dd_test_report({
+        'Subscription_Type' => 1,
+        'Subscription_Details_Quantity' => 1,
+        'payment_method' => 'direct_debit',
+        'property_id' => '54323',
+        'uprn' => '654321',
+    });
+    $new_sub->state('unconfirmed');
+    $new_sub->update;
+
+    my $renewal_from_cc_sub = setup_dd_test_report({
+        'Subscription_Type' => 2,
+        'Subscription_Details_Quantity' => 1,
+        'payment_method' => 'direct_debit',
+        'property_id' => '154323',
+        'uprn' => '1654321',
+    });
+    $renewal_from_cc_sub->state('unconfirmed');
+    $renewal_from_cc_sub->set_extra_metadata('payerReference' => 'GGW1654321');
+    $renewal_from_cc_sub->update;
+
+    my $sub_for_subsequent_renewal_from_cc_sub = setup_dd_test_report({
+        'Subscription_Type' => 2,
+        'Subscription_Details_Quantity' => 1,
+        'payment_method' => 'direct_debit',
+        'property_id' => '154323',
+        'uprn' => '3654321',
+    });
+    $sub_for_subsequent_renewal_from_cc_sub->set_extra_metadata('payerReference' => 'GGW3654321');
+    $sub_for_subsequent_renewal_from_cc_sub->update;
+
+    my $sub_for_unprocessed_cancel = setup_dd_test_report({
+        'Subscription_Type' => 1,
+        'Subscription_Details_Quantity' => 1,
+        'payment_method' => 'direct_debit',
+        'property_id' => '84324',
+        'uprn' => '854325',
+    });
+    my $unprocessed_cancel = setup_dd_test_report({
+        'payment_method' => 'direct_debit',
+        'property_id' => '84324',
+        'uprn' => '854325',
+    });
+    $unprocessed_cancel->state('unconfirmed');
+    $unprocessed_cancel->category('Cancel Garden Subscription');
+    $unprocessed_cancel->update;
+
+    my $sub_for_processed_cancel = setup_dd_test_report({
+        'Subscription_Type' => 1,
+        'Subscription_Details_Quantity' => 1,
+        'payment_method' => 'direct_debit',
+        'property_id' => '54324',
+        'uprn' => '654324',
+    });
+    my $processed_renewal = setup_dd_test_report({
+        'Subscription_Type' => 2,
+        'Subscription_Details_Quantity' => 1,
+        'payment_method' => 'direct_debit',
+        'property_id' => '54324',
+        'uprn' => '654324',
+    });
+    $processed_renewal->set_extra_metadata('dd_date' => '16/03/2021');
+    $processed_renewal->update;
+
+    my $renewal_nothing_in_echo = setup_dd_test_report({
+        'Subscription_Type' => 1,
+        'Subscription_Details_Quantity' => 1,
+        'payment_method' => 'direct_debit',
+        'property_id' => '74321',
+        'uprn' => '754322',
+    });
+
+    my $sub_for_cancel_nothing_in_echo = setup_dd_test_report({
+        'Subscription_Type' => 1,
+        'Subscription_Details_Quantity' => 1,
+        'payment_method' => 'direct_debit',
+        'property_id' => '94324',
+        'uprn' => '954324',
+    });
+
+    my $cancel_nothing_in_echo = setup_dd_test_report({
+        'payment_method' => 'direct_debit',
+        'property_id' => '94324',
+        'uprn' => '954324',
+    });
+    $cancel_nothing_in_echo->state('unconfirmed');
+    $cancel_nothing_in_echo->category('Cancel Garden Subscription');
+    $cancel_nothing_in_echo->update;
+
+    my $c = FixMyStreet::Cobrand::Bromley->new;
+    warnings_are {
+        $c->waste_reconcile_direct_debits;
+    } [
+        "no matching record found for Garden Subscription payment with id GGW554321\n",
+        "no matching record found for Garden Subscription payment with id GGW554399\n",
+        "no matching service to renew for GGW754322\n",
+        "no matching record found for Garden Subscription payment with id GGW854324\n",
+        "no matching record found for Garden Subscription payment with id GGW954325\n",
+        "no matching record found for Cancel payment with id GGW954326\n",
+    ], "warns if no matching record";
+
+    $new_sub->discard_changes;
+    is $new_sub->state, 'confirmed', "New report confirmed";
+    is $new_sub->get_extra_metadata('payerReference'), "GGW654321", "payer reference set";
+    is $new_sub->get_extra_field_value('PaymentCode'), "GGW654321", 'correct echo payment code field';
+    is $new_sub->get_extra_field_value('LastPayMethod'), 3, 'correct echo payment method field';
+
+    $renewal_from_cc_sub->discard_changes;
+    is $renewal_from_cc_sub->state, 'confirmed', "Renewal report confirmed";
+    is $renewal_from_cc_sub->get_extra_field_value('PaymentCode'), "GGW1654321", 'correct echo payment code field';
+    is $renewal_from_cc_sub->get_extra_field_value('Subscription_Type'), 2, 'Renewal has correct type';
+    is $renewal_from_cc_sub->get_extra_field_value('LastPayMethod'), 3, 'correct echo payment method field';
+
+    my $subsequent_renewal_from_cc_sub = FixMyStreet::DB->resultset('Problem')->search({
+            extra => { like => '%uprn,T5:value,I7:3654321%' }
+        },
+        {
+            order_by => { -desc => 'id' }
+        }
+    );
+    is $subsequent_renewal_from_cc_sub->count, 2, "two record for subsequent renewal property";
+    $subsequent_renewal_from_cc_sub = $subsequent_renewal_from_cc_sub->first;
+    is $subsequent_renewal_from_cc_sub->state, 'confirmed', "Renewal report confirmed";
+    is $subsequent_renewal_from_cc_sub->get_extra_field_value('PaymentCode'), "GGW3654321", 'correct echo payment code field';
+    is $subsequent_renewal_from_cc_sub->get_extra_field_value('Subscription_Type'), 2, 'Renewal has correct type';
+    is $subsequent_renewal_from_cc_sub->get_extra_field_value('LastPayMethod'), 3, 'correct echo payment method field';
+
+    $ad_hoc_orig->discard_changes;
+    is $ad_hoc_orig->get_extra_metadata('dd_date'), "01/01/2021", "dd date unchanged ad hoc orig";
+
+    $ad_hoc->discard_changes;
+    is $ad_hoc->state, 'confirmed', "ad hoc report confirmed";
+    is $ad_hoc->get_extra_metadata('dd_date'), "16/03/2021", "dd date set for ad hoc";
+    is $ad_hoc->get_extra_field_value('PaymentCode'), "GGW654325", 'correct echo payment code field';
+    is $ad_hoc->get_extra_field_value('LastPayMethod'), 3, 'correct echo payment method field';
+
+    $ad_hoc_skipped->discard_changes;
+    is $ad_hoc_skipped->state, 'unconfirmed', "ad hoc report not confirmed";
+
+    $hidden->discard_changes;
+    is $hidden->state, 'hidden', "hidden report not confirmed";
+
+    $cc_to_ignore->discard_changes;
+    is $cc_to_ignore->state, 'unconfirmed', "cc payment not confirmed";
+
+    $cancel_nothing_in_echo->discard_changes;
+    is $cancel_nothing_in_echo->state, 'hidden', 'hide already cancelled report';
+
+    my $renewal = FixMyStreet::DB->resultset('Problem')->search({
+            extra => { like => '%uprn,T5:value,I6:654322%' }
+        },
+        {
+            order_by => { -desc => 'id' }
+        }
+    );
+
+    is $renewal->count, 2, "two records for renewal property";
+    my $p = $renewal->first;
+    ok $p->id != $sub_for_renewal->id, "not the original record";
+    is $p->get_extra_field_value('Subscription_Type'), 2, "renewal has correct type";
+    is $p->get_extra_field_value('Subscription_Details_Quantity'), 2, "renewal has correct number of bins";
+    is $p->get_extra_field_value('Subscription_Type'), 2, "renewal has correct type";
+    is $p->get_extra_field_value('LastPayMethod'), 3, 'correct echo payment method field';
+    is $p->state, 'confirmed';
+
+    my $renewal_too_recent = FixMyStreet::DB->resultset('Problem')->search({
+            extra => { like => '%uprn,T5:value,I6:654329%' }
+        },
+        {
+            order_by => { -desc => 'id' }
+        }
+    );
+    is $renewal_too_recent->count, 0, "ignore payments less that three days old";
+
+    my $cancel = FixMyStreet::DB->resultset('Problem')->search({
+            extra => { like => '%uprn,T5:value,I6:654323%' }
+        },
+        {
+            order_by => { -desc => 'id' }
+        }
+    );
+
+    is $cancel->count, 2, "two records for cancel property";
+    $p = $cancel->first;
+    ok $p->id != $sub_for_cancel->id, "not the original record";
+    is $p->get_extra_field_value('Container_Instruction_Action'), 2, "correct containter instruction";
+    is $p->get_extra_field_value('Container_Instruction_Quantity'), 1, "cancel has correct number of bins";
+    is $p->category, 'Cancel Garden Subscription', 'cancel has correct category';
+    is $p->title, 'Garden Subscription - Cancel', 'cancel has correct title';
+    is $p->non_public, 1, 'new report non-public';
+    is $p->get_extra_metadata('dd_date'), "26/02/2021", "dd date set for cancelled";
+    is $p->get_extra_field_value('LastPayMethod'), 3, 'correct echo payment method field';
+    is $p->get_extra_field_value('PaymentCode'), "GGW654323", 'correct echo payment code field';
+    is $p->get_extra_field_value('Subscription_End_Date'), "2021-03-19", 'correct end subscription date';
+    is $p->state, 'confirmed';
+    ok $p->confirmed, "confirmed is not null";
+
+    my $cancel_no_extended = FixMyStreet::DB->resultset('Problem')->search({
+            extra => { like => '%uprn,T5:value,I7:6654326%' }
+        },
+        {
+            order_by => { -desc => 'id' }
+        }
+    );
+
+    is $cancel_no_extended->count, 2, "two records for no extended data cancel property";
+    $p = $cancel_no_extended->first;
+    ok $p->id != $sub_for_cancel_no_extended_data->id, "not the original record";
+    is $p->get_extra_field_value('Container_Instruction_Action'), 2, "correct containter instruction";
+    is $p->get_extra_field_value('Container_Instruction_Quantity'), 0, "no extended data cancel has correct number of bins";
+    is $p->category, 'Cancel Garden Subscription', 'no extended data cancel has correct category';
+    is $p->get_extra_metadata('dd_date'), "26/02/2021", "dd date set for no extended data cancelled";
+    is $p->get_extra_field_value('LastPayMethod'), 3, 'correct echo payment method field';
+    is $p->get_extra_field_value('PaymentCode'), "GGW6654326", 'correct echo payment code field';
+    is $p->state, 'confirmed';
+    ok $p->confirmed, "confirmed is not null";
+
+    my $processed = FixMyStreet::DB->resultset('Problem')->search({
+            extra => { like => '%uprn,T5:value,I6:654324%' }
+        },
+        {
+            order_by => { -desc => 'id' }
+        }
+    );
+    is $processed->count, 2, "two records for processed renewal property";
+
+    my $ad_hoc_processed_rs = FixMyStreet::DB->resultset('Problem')->search({
+            extra => { like => '%uprn,T5:value,I6:654326%' }
+        },
+        {
+            order_by => { -desc => 'id' }
+        }
+    );
+    is $ad_hoc_processed_rs->count, 1, "one records for processed ad hoc property";
+
+    $unprocessed_cancel->discard_changes;
+    is $unprocessed_cancel->state, 'confirmed', 'Unprocessed cancel is confirmed';
+    ok $unprocessed_cancel->confirmed, "confirmed is not null";
+    is $unprocessed_cancel->get_extra_metadata('dd_date'), "21/02/2021", "dd date set for unprocessed cancelled";
+
+    $failed_new_sub->discard_changes;
+    is $failed_new_sub->state, 'hidden', 'failed sub not hidden';
+
+    warnings_are {
+        $c->waste_reconcile_direct_debits;
+    } [
+        "no matching record found for Garden Subscription payment with id GGW554321\n",
+        "no matching record found for Garden Subscription payment with id GGW554399\n",
+        "no matching service to renew for GGW754322\n",
+        "no matching record found for Garden Subscription payment with id GGW854324\n",
+        "no matching record found for Garden Subscription payment with id GGW954325\n",
+        "no matching record found for Cancel payment with id GGW954326\n",
+    ], "warns if no matching record";
+
+    $failed_new_sub->discard_changes;
+    is $failed_new_sub->state, 'hidden', 'failed sub still hidden on second run';
+    $ad_hoc_skipped->discard_changes;
+    is $ad_hoc_skipped->state, 'unconfirmed', "ad hoc report not confirmed on second run";
+};
+
+sub setup_dd_test_report {
+    my $extras = shift;
+    my ($report) = $mech->create_problems_for_body( 1, $body->id, 'Test', {
+        category => 'Garden Subscription',
+        latitude => 51.402096,
+        longitude => 0.015784,
+        cobrand => 'bromley',
+        areas => '2482,8141',
+        user => $user,
+    });
+    my @extras = map { { name => $_, value => $extras->{$_} } } keys %$extras;
+    $report->set_extra_fields( @extras );
+    $report->update;
+
+    return $report;
+}
 
 done_testing();

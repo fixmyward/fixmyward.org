@@ -14,6 +14,9 @@
         - Update URL on /my when map moves. #3358
         - Make anonymous updates clearer in email alerts. #3417
         - Add Maidenhead Locator support to search box.
+        - Inspector-managers can now assign reports to inspectors. #3535
+        - Inspectors & other staff can see report assignments and
+          which reports are unassigned. #3535
     - Bugfixes:
         - Fix non-JS form when all extra questions answered. #3248
         - Improve display of disabled fields in iOS.
@@ -23,6 +26,13 @@
         - Fix Gaze sometimes being called twice on /around. #3324
         - Improved alert signup for phone-only user. #3367
         - Fix moderation of update text.
+        - Only trigger one refresh going Back to list view. #3476
+        - Fix checked order of updates in dashboard export.
+        - Fix unable to edit user with verified landline #3295
+        - Fix 'sites' page to reflect active fixmystreet sites #2481
+        - Fix ordering of dropdown lists in extra questions #3566
+        - Fix removal of cached opengraph photos.
+        - Do not email inactive body comment users. #3587
     - Admin improvements:
         - Enable per-category hint customisation.
         - Move ban/unban buttons to user edit admin page.
@@ -35,17 +45,25 @@
         - Always record contributed_by for staff users.
         - Add per-photo moderation. #3055
         - Redaction support for photos.
+        - UK Councils no questionnaires for non-updating users
+        - Script to export/import response templates, #3549
+        - Assignees of reports are visible in list and edit page. #3535
     - Development improvements:
         - Include failure count in send report error output, #3316
         - Sort output in export script. #3323
         - Show relevant updates in alert-update email preview. #3417
+        - Add German and Swiss language packs to default
+        linux install #3544
         - Upgrade jQuery. #3017
     - Open311 improvements:
         - Consistent protected field ordering.
+        - Move test handling out of core code.
     - Security:
         - Increase minimum password length to eight.
     - Changes
         - Send contact form emails from do-not-reply address if sender's domain uses DMARC.
+    - New features:
+        - Roles can now have category restrictions like users.
 
 * v3.1 (16th November 2020)
     - Security:

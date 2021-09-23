@@ -417,6 +417,11 @@ sub munge_report_new_bodies {
     if (!$on_he_road) {
         %$bodies = map { $_->id => $_ } grep { $_->name ne 'Highways England' } values %$bodies;
     }
+    # Environment agency added with odour category for FixmyStreet
+    # in all England areas, but should not show for cobrands
+    if ( $bodies->{'Environment Agency'} ) {
+        %$bodies = map { $_->id => $_ } grep { $_->name ne 'Environment Agency' } values %$bodies;
+    }
 }
 
 sub munge_surrounding_london {
@@ -461,6 +466,16 @@ sub munge_red_route_categories {
     }
 }
 
+around 'munge_sendreport_params' => sub {
+    my ($orig, $self, $row, $h, $params) = @_;
+
+    $self->$orig($row, $h, $params);
+
+    if ($row->category eq "Countdown - not working") {
+        $params->{From} = [ $self->do_not_reply_email, $self->contact_name ];
+    }
+};
+
 sub is_hardcoded_category {
     my ($self, $category) = @_;
 
@@ -479,6 +494,7 @@ sub _tlrn_categories { [
     "Damage - general (Trees)",
     "Dead animal in the carriageway or footway",
     "Debris in the carriageway",
+    "Drain Cover - Missing or Damaged",
     "Fallen Tree",
     "Flooding",
     "Graffiti / Flyposting (non-offensive)",

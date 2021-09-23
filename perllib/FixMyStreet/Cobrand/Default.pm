@@ -793,6 +793,7 @@ sub available_permissions {
             contribute_as_body => _("Create reports/updates as the council"),
             default_to_body => _("Default to creating reports/updates as the council"),
             view_body_contribute_details => _("See user detail for reports created as the council"),
+            assign_report_to_user => _("Assign problem reports to users"),
         },
         _("Users") => {
             user_edit => _("Edit users' details/search for their reports"),
@@ -1119,6 +1120,15 @@ sub report_check_for_errors {
 
 sub report_sent_confirmation_email { '' }
 
+=item post_report_sent
+
+Perform any cobrand specific actions that need to happen to a report after it
+has been sent. Takes the report as an argument.
+
+=cut
+
+sub post_report_sent { '' }
+
 =item never_confirm_reports
 
 If true then we never send an email to confirm a report
@@ -1367,6 +1377,25 @@ sub emergency_message {
     my $field = 'emergency_message';
     $field .= "_$type" if $type;
     FixMyStreet::Template::SafeString->new($body->get_extra_metadata($field));
+}
+
+# Report if cobrand denies updates by user
+# Default 'allows'
+sub deny_updates_by_user {
+    return;
+}
+
+=item report_a_problem_link
+
+Cobrand-specific option for the 'Report a problem here' link displayed in the
+top left-hand corner of the page after a problem report.
+
+Default is empty string (false).
+
+=cut
+
+sub post_report_report_problem_link {
+    return;
 }
 
 1;

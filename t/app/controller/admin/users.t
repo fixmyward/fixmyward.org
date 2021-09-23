@@ -319,6 +319,7 @@ my %default_perms = (
     "permissions[report_edit_priority]" => undef,
     "permissions[report_inspect]" => undef,
     "permissions[report_instruct]" => undef,
+    "permissions[assign_report_to_user]" => undef,
     "permissions[report_prefill]" => undef,
     "permissions[contribute_as_another_user]" => undef,
     "permissions[contribute_as_anonymous_user]" => undef,
@@ -549,6 +550,27 @@ FixMyStreet::override_config {
         } } );
         $mech->content_contains( 'Updated!' );
     };
+
+    subtest "Test edit user name with phone number unchanged who has verified landline" => sub {
+        my $existing_user = $mech->create_user_ok('existing@example.com', name => 'Existing User', phone => '01184960017', phone_verified => 1 );
+	$mech->get_ok( '/admin/users/' . $existing_user->id );
+	$mech->submit_form_ok( { with_fields => {
+            name => 'Existing E. User',
+        } } );
+	$mech->content_contains( 'Updated!' );
+    };
+
+    subtest "Test edit user change phone number who has verified landline" => sub {
+        my $existing_user = $mech->create_user_ok('existing@example.com', name => 'Existing User', phone => '01184960017', phone_verified => 1 );
+	$mech->get_ok( '/admin/users/' . $existing_user->id );
+	$mech->submit_form_ok( { with_fields => {
+            phone => '01184960018',
+	} } );
+	$mech->content_lacks( 'Updated!' );
+	$mech->content_contains( 'Please check your phone number is correct' );
+    };
+
+
 
     subtest "Test changing user to an existing one" => sub {
         my $existing_user = $mech->create_user_ok('existing@example.com', name => 'Existing User');

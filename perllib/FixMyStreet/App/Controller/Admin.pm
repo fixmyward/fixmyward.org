@@ -160,6 +160,21 @@ sub fetch_contacts : Private {
     return 1;
 }
 
+sub stash_contacts_for_template : Private {
+    my ( $self, $c, $contacts ) = @_;
+
+    my %active_contacts = map { $_ => 1 } @$contacts;
+    my @live_contacts = $c->stash->{live_contacts}->all;
+    my @all_contacts = map { {
+        id => $_->id,
+        category => $_->category,
+        active => $active_contacts{$_->id},
+        group => $_->groups,
+    } } @live_contacts;
+
+    $c->stash->{contacts} = \@all_contacts;
+}
+
 sub fetch_languages : Private {
     my ( $self, $c ) = @_;
 
@@ -507,10 +522,8 @@ sub fetch_body_areas : Private {
 
 sub update_extra_fields : Private {
     my ($self, $c, $object) = @_;
-
     my @indices = grep { /^metadata\[\d+\]\.code/ } keys %{ $c->req->params };
     @indices = sort map { /(\d+)/ } @indices;
-
     my @extra_fields;
     foreach my $i (@indices) {
         my $meta = {};
@@ -532,7 +545,7 @@ sub update_extra_fields : Private {
                 $meta->{values} = [];
                 my $re = qr{^metadata\[$i\]\.values\[\d+\]\.key};
                 my @vindices = grep { /$re/ } keys %{ $c->req->params };
-                @vindices = sort map { /values\[(\d+)\]/ } @vindices;
+                @vindices = sort { $a <=> $b } map { /values\[(\d+)\]/ } @vindices;
                 foreach my $j (@vindices) {
                     my $name = $c->get_param("metadata[$i].values[$j].name");
                     my $key = $c->get_param("metadata[$i].values[$j].key");
