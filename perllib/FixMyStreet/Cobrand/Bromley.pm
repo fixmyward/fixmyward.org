@@ -481,6 +481,13 @@ sub munge_report_new_contacts {
     } else {
         @$categories = grep { grep { $_ ne 'Waste' } @{$_->groups} } @$categories;
     }
+
+    my $user = $self->{c}->user;
+    if ($user && $user->belongs_to_body($self->body->id) && $user->get_extra_metadata('assigned_categories_only')) {
+        my %user_categories = map { $_ => 1} @{$user->categories};
+        @$categories = grep { $user_categories{$_->category} } @$categories;
+    }
+
     $self->SUPER::munge_report_new_contacts($categories);
 }
 
